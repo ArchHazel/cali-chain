@@ -169,6 +169,11 @@ if __name__ == "__main__":
     print("FINAL WORLD POSITIONS")
     print("="*30)
     
+    # Save camera extrinsics (T_world_cam) for depth stitching etc.
+    cam_extrinsics = {k: pose_dict[k].tolist() for k in pose_dict if "cam" in k}
+    with open(out_dir / "cam_extrinsics.json", "w") as f:
+        json.dump(cam_extrinsics, f, indent=2)
+
     # Sort keys for cleaner output
     sorted_keys = sorted(pose_dict.keys())
     
