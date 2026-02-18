@@ -17,6 +17,7 @@ if __name__ == "__main__":
             ret, frame = cap.read()
             if not ret:
                 break
+            frame = cv2.flip(frame, 1)
             cv2.imwrite(str(out_img_dir / f"{frame_count:06d}.jpg"), frame)
             frame_count += 1
         cap.release()

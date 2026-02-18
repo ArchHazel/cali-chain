@@ -10,9 +10,14 @@ K = np.array([
     [0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00]
 ])
 
-cam_params = [1.110516063691994532e+03, 1.119431526830967186e+03, 9.560036883813438635e+02, 4.795592441694046784e+02]
+# cam_params = [1.110516063691994532e+03, 1.119431526830967186e+03, 9.560036883813438635e+02, 4.795592441694046784e+02]
+cam_params = [1081.3, 1081.3, 959.5, 539.5]
 
 if __name__ == "__main__":
+
+    out_dir = Path("output")
+    out_dir.mkdir(exist_ok=True)
+
 
     apriltag_detector = Detector(
         families="tag36h11",
@@ -35,37 +40,52 @@ if __name__ == "__main__":
             continue
         img = cv2.imread(str(img_path))
         # flip the image horizontally
-        img = cv2.flip(img, 1)
         img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         # flip the image horizontally
         detections = apriltag_detector.detect(
             img_gray,
             estimate_tag_pose=True,
             camera_params=cam_params,
-            tag_size=0.4318,
+            tag_size=0.12,
         )
 
         apriltag_cam = []
         if detections:
             print(f"Detected {len(detections)} tags in {cam_name}")
 
-            # sort detections by the x-coordinate of the center of the tag
-            detections.sort(key=lambda x: x.center[0])
             # save the transformation matrix of the tag
             for detection in detections:
                 trans_mat = np.eye(4)
                 trans_mat[:3, :3] = detection.pose_R
                 trans_mat[:3, 3] = detection.pose_t.flatten()
 
-                apriltag_cam.append(trans_mat)
+                apriltag_cam.append({
+                    "tag_id": detection.tag_id,
+                    "trans_mat": trans_mat.tolist()
+                })
 
                 # visualize the contour of the tag
-                print(detection.corners)
+                # print(detection.corners)
+                
                 for corner_id in range(4):
                     l0 = detection.corners[corner_id].astype(int)
                     l1 = detection.corners[(corner_id + 1) % 4].astype(int)
                     cv2.line(img, (l0[0], l0[1]), (l1[0], l1[1]), (0, 255, 0), 2)
-                    
+
+                # Draw tag ID at center
+                cx, cy = detection.center.astype(int)
+                cv2.putText(
+                    img,
+                    str(detection.tag_id),
+                    (cx - 20, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 0),
+                    2,
+                )
+            
+
+            cv2.imwrite(str(out_dir / f"{cam_name}.jpg"), img)
             cv2.imshow("img", img)
             cv2.waitKey(0)
             
@@ -73,5 +93,5 @@ if __name__ == "__main__":
         else:
             print(f"No tags detected in {cam_name}")
 
-    with open("data/apriltag_results.json", "w") as f:
+    with open(out_dir / "apriltag_results.json", "w") as f:
         json.dump(apriltag_results, f, indent=4)
