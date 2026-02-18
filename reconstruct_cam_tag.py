@@ -8,6 +8,52 @@ def get_translation(matrix):
     """Extracts the X, Y, Z translation vector from a 4x4 matrix."""
     return matrix[:3, 3]
 
+
+def camera_frustum_mesh(length=0.15, back_size=0.04, front_size=0.10, edge_radius=0.002):
+    """
+    Create a camera frustum mesh in camera frame: origin at camera, looking along +Z.
+    Small rectangle at back (z=0), larger at front (z=length).
+    Black faces for the body, blue edges (thin cylinders).
+    """
+    s = back_size / 2
+    b = front_size / 2
+    f = length
+    vertices = np.array([
+        [-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0],   # back (z=0)
+        [-b, -b, f], [b, -b, f], [b, b, f], [-b, b, f],   # front (z=f)
+    ], dtype=np.float64)
+    # Triangles: back (2), front (2), 4 sides (2 each) = 12 faces
+    faces = np.array([
+        [0, 2, 1], [0, 3, 2],           # back
+        [4, 5, 6], [4, 6, 7],           # front
+        [0, 1, 5], [0, 5, 4],           # bottom
+        [1, 2, 6], [1, 6, 5],           # right
+        [2, 3, 7], [2, 7, 6],           # top
+        [3, 0, 4], [3, 4, 7],           # left
+    ], dtype=np.int32)
+    frustum = trimesh.Trimesh(vertices=vertices, faces=faces)
+    n_frustum_faces = len(frustum.faces)
+    frustum.visual.face_colors = np.tile([0, 0, 0, 255], (n_frustum_faces, 1)).astype(np.uint8)
+
+    # 12 edges: back 4, front 4, connecting 4
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+    edge_meshes = []
+    for i, j in edges:
+        seg = np.array([vertices[i], vertices[j]], dtype=np.float64)
+        cyl = trimesh.creation.cylinder(radius=edge_radius, segment=seg)
+        cyl.visual.face_colors = np.tile([0, 0, 255, 255], (len(cyl.faces), 1)).astype(np.uint8)
+        edge_meshes.append(cyl)
+
+    combined = trimesh.util.concatenate([frustum] + edge_meshes)
+    # Re-apply face colors (concatenate can drop per-mesh visuals)
+    n_combined = len(combined.faces)
+    face_colors = np.zeros((n_combined, 4), dtype=np.uint8)
+    face_colors[:n_frustum_faces] = [0, 0, 0, 255]
+    face_colors[n_frustum_faces:] = [0, 0, 255, 255]
+    combined.visual.face_colors = face_colors
+    return combined
+
+
 if __name__ == "__main__":
 
     out_dir = Path("output")
@@ -138,7 +184,7 @@ if __name__ == "__main__":
             mesh.apply_transform(pose_dict[k])
             indoor_scene.append(mesh)
         else:
-            mesh = trimesh.creation.icosphere(radius=0.1)
+            mesh = camera_frustum_mesh(length=0.15, back_size=0.04, front_size=0.10)
             mesh.apply_transform(pose_dict[k])
             indoor_scene.append(mesh)
     
