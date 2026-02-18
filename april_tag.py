@@ -1,0 +1,77 @@
+from pupil_apriltags import Detector
+from pathlib import Path
+import json
+import cv2
+import numpy as np
+
+K = np.array([
+    [1.110516063691994532e+03,0.000000000000000000e+00,9.560036883813438635e+02],
+    [0.000000000000000000e+00,1.119431526830967186e+03,4.795592441694046784e+02],
+    [0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00]
+])
+
+cam_params = [1.110516063691994532e+03, 1.119431526830967186e+03, 9.560036883813438635e+02, 4.795592441694046784e+02]
+
+if __name__ == "__main__":
+
+    apriltag_detector = Detector(
+        families="tag36h11",
+        nthreads=4,
+        quad_decimate=1.0,
+        quad_sigma=0.0,
+        refine_edges=1,
+        decode_sharpening=0.25,
+        debug=0
+    )
+
+    with open("data/cam_frame_ids.json", "r") as f:
+        cam_frame_ids = json.load(f)
+    
+    apriltag_results = {}
+    for cam_name, frame_id in cam_frame_ids.items():
+        img_path = Path(f"data/imgs/{cam_name}/{frame_id}.jpg")
+        if not img_path.exists():
+            print(f"Image {img_path} does not exist")
+            continue
+        img = cv2.imread(str(img_path))
+        # flip the image horizontally
+        img = cv2.flip(img, 1)
+        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # flip the image horizontally
+        detections = apriltag_detector.detect(
+            img_gray,
+            estimate_tag_pose=True,
+            camera_params=cam_params,
+            tag_size=0.4318,
+        )
+
+        apriltag_cam = []
+        if detections:
+            print(f"Detected {len(detections)} tags in {cam_name}")
+
+            # sort detections by the x-coordinate of the center of the tag
+            detections.sort(key=lambda x: x.center[0])
+            # save the transformation matrix of the tag
+            for detection in detections:
+                trans_mat = np.eye(4)
+                trans_mat[:3, :3] = detection.pose_R
+                trans_mat[:3, 3] = detection.pose_t.flatten()
+
+                apriltag_cam.append(trans_mat)
+
+                # visualize the contour of the tag
+                print(detection.corners)
+                for corner_id in range(4):
+                    l0 = detection.corners[corner_id].astype(int)
+                    l1 = detection.corners[(corner_id + 1) % 4].astype(int)
+                    cv2.line(img, (l0[0], l0[1]), (l1[0], l1[1]), (0, 255, 0), 2)
+                    
+            cv2.imshow("img", img)
+            cv2.waitKey(0)
+            
+            apriltag_results[cam_name] = apriltag_cam
+        else:
+            print(f"No tags detected in {cam_name}")
+
+    with open("data/apriltag_results.json", "w") as f:
+        json.dump(apriltag_results, f, indent=4)
