@@ -9,12 +9,7 @@ import json
 import numpy as np
 from pathlib import Path
 
-# Default intrinsics (e.g. from calibration); override via output/cam_intrinsics.json
-DEFAULT_K = np.array([
-    [1.110516063691994532e03, 0.0, 9.560036883813438635e02],
-    [0.0, 1.119431526830967186e03, 4.795592441694046784e02],
-    [0.0, 0.0, 1.0],
-])
+from utils import load_cam_intrinsics
 
 OUT_DIR = Path("output")
 VIDEOS_DIR = Path("data/videos")
@@ -22,22 +17,6 @@ DEPTH_SUBDIR = "depth"
 DEPTH_FILENAME = "depth_1.npy"
 # If depth is in millimeters, set to 0.001 to convert to meters
 DEPTH_SCALE = 0.001
-
-
-def load_intrinsics():
-    """Load K from output/cam_intrinsics.json if present, else default."""
-    p = OUT_DIR / "cam_intrinsics.json"
-    if p.exists():
-        with open(p) as f:
-            data = json.load(f)
-        # Support single "K" or per-cam "cam_name": [[...]]
-        if "K" in data:
-            return np.array(data["K"], dtype=np.float64)
-        # Use first cam's K as global if per-cam
-        first = next(iter(data.values()))
-        return np.array(first, dtype=np.float64)
-    return DEFAULT_K.copy()
-
 
 def depth_to_points(depth, K, T_world_cam, depth_min=0.1, depth_max=10.0, stride=1, depth_scale=1.0):
     """
@@ -77,7 +56,6 @@ def main():
     with open(ext_path) as f:
         cam_extrinsics = json.load(f)
 
-    K = load_intrinsics()
     all_pts = []
     all_colors = []  # optional: one color per cam for visualization
 
@@ -95,6 +73,8 @@ def main():
             # (num_frames, H, W) -> use first frame only
             depth = depth[0]
         assert depth.ndim == 2, f"Expected (H,W), got {depth.shape}"
+
+        K, _ = load_cam_intrinsics(cam_name)
 
         pts = depth_to_points(depth, K, T_world_cam, stride=2, depth_scale=DEPTH_SCALE)
         if pts.size == 0:

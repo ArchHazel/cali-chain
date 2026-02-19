@@ -4,14 +4,7 @@ import json
 import cv2
 import numpy as np
 
-K = np.array([
-    [1.110516063691994532e+03,0.000000000000000000e+00,9.560036883813438635e+02],
-    [0.000000000000000000e+00,1.119431526830967186e+03,4.795592441694046784e+02],
-    [0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00]
-])
-
-# cam_params = [1.110516063691994532e+03, 1.119431526830967186e+03, 9.560036883813438635e+02, 4.795592441694046784e+02]
-cam_params = [1081.3, 1081.3, 959.5, 539.5]
+from utils import load_cam_intrinsics
 
 if __name__ == "__main__":
 
@@ -38,6 +31,9 @@ if __name__ == "__main__":
         if not img_path.exists():
             print(f"Image {img_path} does not exist")
             continue
+
+        _, cam_params = load_cam_intrinsics(cam_name)
+
         img = cv2.imread(str(img_path))
         # flip the image horizontally
         img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
