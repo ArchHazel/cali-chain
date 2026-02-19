@@ -2,8 +2,17 @@ import json
 import numpy as np
 import trimesh
 from pathlib import Path
+from types import SimpleNamespace
 
+from utils import get_tag_pose_in_world
 
+TAG1_CONFIG = SimpleNamespace(
+    width_m=0.12,
+    height_m=0.12,
+    wall_facing="pos_x",
+    measured_corner="bottom_left",
+    position_xyz=[0, 0.1413, 1.2383],
+)
 def get_translation(matrix):
     """Extracts the X, Y, Z translation vector from a 4x4 matrix."""
     return matrix[:3, 3]
@@ -81,12 +90,11 @@ if __name__ == "__main__":
     ]
 
     # --- INITIALIZATION ---
-    # Initialize dictionary to store 4x4 World Pose Matrices
-    # We assume Tag 1 is at [0, 1.685, 0.228] with Identity rotation (aligned with World)
-    
+    # Build the 4x4 world pose for tag 1
+    center, rotation, _, _ = get_tag_pose_in_world(TAG1_CONFIG)
     T_world_tag1 = np.eye(4)
-    # T_world_tag1[:3, 3] = np.array([0, 0.2013, 1.2983])
-    T_world_tag1[:3, 3] = np.array([0.2013, -1.2983, 0])
+    T_world_tag1[:3, :3] = rotation
+    T_world_tag1[:3, 3] = center
     
     pose_dict = {
         'tag1': T_world_tag1
