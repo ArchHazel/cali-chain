@@ -66,7 +66,7 @@ if __name__ == "__main__":
                 for corner_id in range(4):
                     l0 = detection.corners[corner_id].astype(int)
                     l1 = detection.corners[(corner_id + 1) % 4].astype(int)
-                    cv2.line(img, (l0[0], l0[1]), (l1[0], l1[1]), (0, 255, 0), 2)
+                    cv2.line(img, (l0[0], l0[1]), (l1[0], l1[1]), (0, 255, 0), 1)
 
                 # Draw tag ID at center
                 cx, cy = detection.center.astype(int)

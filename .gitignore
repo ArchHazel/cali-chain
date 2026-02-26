@@ -2,3 +2,7 @@ data/
 output/
 
 __pycache__/
+
+# colmap
+*.ini
+*.db
