@@ -1,0 +1,79 @@
+defaults:
+  - dataset: calib_4
+  - _self_
+
+data:
+  frames_dir: data/${dataset.session}/frames
+
+intrinsics:
+  session: intrinsic_1
+  dir: output/${intrinsics.session}/intrinsics
+  fallback:
+    fx: 1081.37
+    fy: 1081.37
+    cx: 959.5
+    cy: 539.5
+
+apriltag:
+  family: "tag36h11"
+  tag_size_m: 0.12
+
+# Anchor tag with known world pose
+anchor:
+  tag_id: 1
+  width_m: 0.12
+  height_m: 0.12
+  wall_facing: "pos_x"
+  measured_corner: "bottom_left"
+  position_xyz: [0, 0.1413, 1.2383]
+
+# Validation tags with known world poses
+# null in position_xyz = skip that axis in error computation
+validation:
+  - tag_id: 0
+    width_m: 0.12
+    height_m: 0.12
+    wall_facing: "pos_y"
+    measured_corner: "bottom_right"
+    position_xyz: [0.048, 0, null]
+
+  - tag_id: 6
+    width_m: 0.12
+    height_m: 0.12
+    wall_facing: "pos_x"
+    measured_corner: "bottom_left"
+    position_xyz: [0, 0.3513, 1.2383]
+
+# Per-camera: frame to use and which tag IDs to consider
+cameras:
+  HAR6:
+    frame: "000000.jpg"
+    tags: [0, 1, 6, 7]
+  new:
+    frame: "000000.jpg"
+    tags: [0, 2, 5, 7, 10]
+  HAR2:
+    frame: "000000.jpg"
+    tags: [2, 8, 9]
+  HAR1:
+    frame: "000000.jpg"
+    tags: [9]
+  HAR3:
+    frame: "000000.jpg"
+    tags: [8]
+  HAR8:
+    frame: "000000.jpg"
+    tags: [5, 10]
+
+# Solve order: each camera is solved using ALL known tags it sees,
+# then all tags it detected are added to the known set.
+chain:
+  - HAR6
+  - new
+  - HAR8
+  - HAR2
+  - HAR3
+  - HAR1
+
+output:
+  dir: output/${dataset.session}/extrinsics

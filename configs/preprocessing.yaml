@@ -1,0 +1,9 @@
+defaults:
+  - dataset: intrinsic_1
+  - _self_
+
+data:
+  raw_video_dir: data/${dataset.session}/videos
+  frames_dir: data/${dataset.session}/frames
+  video_filename: "rgb.avi"
+  frame_format: "{frame_id:06d}.jpg"
