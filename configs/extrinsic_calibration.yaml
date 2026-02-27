@@ -17,6 +17,7 @@ intrinsics:
 apriltag:
   family: "tag36h11"
   tag_size_m: 0.12
+  undistort: true
 
 # Anchor tag with known world pose
 anchor:

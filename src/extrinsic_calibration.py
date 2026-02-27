@@ -1,7 +1,7 @@
 """
 Extrinsic Calibration Pipeline.
 
-1. Detect apriltags in each camera's selected frame (undistorted inline)
+1. Detect apriltags in each camera's selected frame (optionally undistorted)
 2. Seed known tags from the anchor
 3. Walk the chain: for each camera, solve its pose using the CLOSEST known tag
    (by camera-frame depth), then register all newly seen tags
@@ -15,6 +15,7 @@ Duplicate tag ID handling:
 Usage:
     python -m src.extrinsic_calibration
     python -m src.extrinsic_calibration dataset=calib_4 intrinsics.session=intrinsic_1
+    python -m src.extrinsic_calibration apriltag.undistort=true
 """
 
 import json
@@ -80,19 +81,23 @@ def detect_tags(
     tag_size: float,
     K: np.ndarray,
     dist_coeffs: np.ndarray | None = None,
+    undistort: bool = False,
 ) -> list[dict]:
     """
-    Detect apriltags. Undistorts the image first if dist_coeffs is provided.
-    Uses the undistorted image for detection but cam_params from the original K
-    (since undistort with newCameraMatrix=K preserves the intrinsics).
+    Detect apriltags. Optionally undistorts the image first if undistort=True
+    and dist_coeffs is provided.
+    Uses newCameraMatrix=K so the intrinsic parameters remain valid after undistortion.
     """
     img = cv2.imread(str(img_path))
     if img is None:
         log.warning(f"Could not read: {img_path}")
         return []
 
-    # if dist_coeffs is not None:
-    #     img = cv2.undistort(img, K, dist_coeffs, None, K)
+    if undistort and dist_coeffs is not None:
+        img = cv2.undistort(img, K, dist_coeffs, None, K)
+        log.debug(f"Undistorted image: {img_path.name}")
+    elif undistort and dist_coeffs is None:
+        log.warning(f"Undistort requested but no dist_coeffs available for {img_path.name}, skipping undistortion")
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     detections = detector.detect(
@@ -453,11 +458,17 @@ def main(cfg: DictConfig):
     log.info(f"Extrinsic Calibration Pipeline\n{OmegaConf.to_yaml(cfg)}")
 
     tag_size = cfg.apriltag.tag_size_m
+    undistort = cfg.apriltag.get("undistort", False)
+
+    if undistort:
+        log.info("Undistortion ENABLED for tag detection")
+    else:
+        log.info("Undistortion DISABLED for tag detection")
 
     # 1. Create detector
     detector = Detector(families=cfg.apriltag.family, **DETECTOR_KWARGS)
 
-    # 2. Detect ALL tags in each camera's frame (undistorted inline)
+    # 2. Detect ALL tags in each camera's frame (optionally undistorted)
     cameras = OmegaConf.to_container(cfg.cameras, resolve=True)
     all_detections: dict[str, list[dict]] = {}
     chain_detections: dict[str, list[dict]] = {}
@@ -476,7 +487,7 @@ def main(cfg: DictConfig):
         K, cam_params, dist_coeffs = load_intrinsics(cfg, cam_id)
         all_K[cam_id] = K
 
-        dets = detect_tags(detector, frame_path, cam_params, tag_size, K, dist_coeffs)
+        dets = detect_tags(detector, frame_path, cam_params, tag_size, K, dist_coeffs, undistort=undistort)
         all_detections[cam_id] = dets
         chain_detections[cam_id] = filter_detections(dets, allowed_tags)
 
