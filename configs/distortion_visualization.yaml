@@ -1,0 +1,16 @@
+defaults:
+  - dataset: intrinsic_1
+  - _self_
+
+data:
+  frames_dir: data/${dataset.session}/frames
+
+intrinsics:
+  dir: output/${dataset.session}/intrinsics
+  calibration_config: configs/intrinsic_calibration.yaml
+
+# null = all cameras from intrinsic calibration config
+cameras: null
+
+output:
+  dir: output/${dataset.session}/distortion_vis
