@@ -115,6 +115,7 @@ def detect_tags(
         results.append({
             "tag_id": det.tag_id,
             "corners": det.corners,
+            "center": det.center,
             "T_cam_tag": T,
         })
     return results
@@ -296,12 +297,26 @@ def propagate_chain(
     chain_detections: dict[str, list[dict]],
     all_K: dict[str, np.ndarray],
     tag_size: float,
-) -> dict[str, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], dict[str, int], dict[str, list[str]]]:
+    """
+    Returns:
+        pose_dict: all computed poses (cameras and tags)
+        node_jumps: {node_key: number of jumps from anchor}
+        node_paths: {node_key: [chain path from anchor]}
+    """
     chain = OmegaConf.to_container(cfg.chain, resolve=True)
     pose_dict: dict[str, np.ndarray] = {}
 
+    # Track jump counts and paths from anchor
+    # A "jump" = one tag->camera or camera->tag link
+    node_jumps: dict[str, int] = {}
+    node_paths: dict[str, list[str]] = {}
+
     for tag_id, T in known_tags.items():
-        pose_dict[f"tag{tag_id}"] = T
+        key = f"tag{tag_id}"
+        pose_dict[key] = T
+        node_jumps[key] = 0
+        node_paths[key] = [key]
 
     for cam_id in chain:
         cam_id = str(cam_id)
@@ -319,10 +334,17 @@ def propagate_chain(
             log.warning(f"[{cam_id}] PnP failed. Skipping.")
             continue
 
-        pose_dict[f"cam{cam_id}"] = T_world_cam
+        cam_key = f"cam{cam_id}"
+        pose_dict[cam_key] = T_world_cam
+
+        # Camera jump count = tag it solved from + 1
+        used_tag_key = f"tag{used_tag}"
+        node_jumps[cam_key] = node_jumps.get(used_tag_key, 0) + 1
+        node_paths[cam_key] = node_paths.get(used_tag_key, [used_tag_key]) + [cam_key]
+
         pos = T_world_cam[:3, 3]
         log.info(
-            f"[{cam_id}] Solved using tag {used_tag}  "
+            f"[{cam_id}] Solved using tag {used_tag} ({node_jumps[cam_key]} jumps)  "
             f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]"
         )
 
@@ -348,11 +370,16 @@ def propagate_chain(
 
             T_world_tag = T_world_cam @ det["T_cam_tag"]
             known_tags[tag_id] = T_world_tag
-            pose_dict[f"tag{tag_id}"] = T_world_tag
+            tag_key = f"tag{tag_id}"
+            pose_dict[tag_key] = T_world_tag
+
+            # Tag jump count = camera that registered it + 1
+            node_jumps[tag_key] = node_jumps[cam_key] + 1
+            node_paths[tag_key] = node_paths[cam_key] + [tag_key]
 
             tag_pos = T_world_tag[:3, 3]
             log.info(
-                f"  Registered tag{tag_id}  "
+                f"  Registered tag{tag_id} ({node_jumps[tag_key]} jumps)  "
                 f"pos=[{tag_pos[0]:.3f}, {tag_pos[1]:.3f}, {tag_pos[2]:.3f}]"
             )
             new_tags += 1
@@ -360,7 +387,7 @@ def propagate_chain(
         if new_tags == 0:
             log.info(f"  No new tags registered")
 
-    return pose_dict
+    return pose_dict, node_jumps, node_paths
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +477,125 @@ def validate(
 
 
 # ---------------------------------------------------------------------------
+# Detection visualization
+# ---------------------------------------------------------------------------
+
+# Color palette for tag IDs (BGR)
+TAG_COLORS = [
+    (0, 255, 0),     # green
+    (0, 165, 255),   # orange
+    (255, 0, 0),     # blue
+    (0, 255, 255),   # yellow
+    (255, 0, 255),   # magenta
+    (255, 255, 0),   # cyan
+    (0, 128, 255),   # dark orange
+    (128, 0, 255),   # purple
+    (255, 128, 0),   # light blue
+    (0, 255, 128),   # spring green
+    (128, 255, 0),   # chartreuse
+    (255, 0, 128),   # pink
+]
+
+
+def get_tag_color(tag_id: int) -> tuple[int, int, int]:
+    """Get a consistent color for a tag ID."""
+    return TAG_COLORS[tag_id % len(TAG_COLORS)]
+
+
+def visualize_detections(
+    all_detections: dict[str, list[dict]],
+    cameras_cfg: dict,
+    frames_dir: Path,
+    out_dir: Path,
+    K_dict: dict[str, np.ndarray],
+    dist_dict: dict[str, np.ndarray | None],
+    undistort: bool = False,
+):
+    """
+    For each camera, draw all detected tag bounding boxes and IDs on the image
+    and save the annotated image.
+    """
+    vis_dir = out_dir / "tag_detections"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    for cam_id, detections in all_detections.items():
+        cam_cfg = cameras_cfg.get(cam_id)
+        if cam_cfg is None:
+            continue
+
+        frame_name = cam_cfg["frame"]
+        frame_path = frames_dir / cam_id / frame_name
+
+        if not frame_path.exists():
+            log.warning(f"[{cam_id}] Frame not found for visualization: {frame_path}")
+            continue
+
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            log.warning(f"[{cam_id}] Could not read image: {frame_path}")
+            continue
+
+        # Apply undistortion if enabled (same as detection)
+        K = K_dict.get(cam_id)
+        dist_coeffs = dist_dict.get(cam_id)
+        if undistort and dist_coeffs is not None and K is not None:
+            img = cv2.undistort(img, K, dist_coeffs, None, K)
+
+        if not detections:
+            # Save image with "no detections" label
+            cv2.putText(
+                img, "No tags detected", (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3,
+            )
+            out_path = vis_dir / f"{cam_id}.jpg"
+            cv2.imwrite(str(out_path), img)
+            log.info(f"[{cam_id}] No detections — saved {out_path.name}")
+            continue
+
+        # Draw each detection
+        for det in detections:
+            tag_id = det["tag_id"]
+            corners = det["corners"].astype(np.int32)
+            center = det["center"].astype(int)
+            color = get_tag_color(tag_id)
+            t = det["T_cam_tag"][:3, 3]
+
+            # Draw tag contour (1px thin so exact pixel boundary is visible)
+            cv2.polylines(img, [corners], isClosed=True, color=color, thickness=1)
+
+            # Label above the topmost corner, outside the bounding box
+            top_idx = int(np.argmin(corners[:, 1]))
+            top_pt = corners[top_idx]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            label = f"ID:{tag_id}  d={np.linalg.norm(t):.2f}m"
+            font_scale = 0.5
+            thickness = 1
+            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            label_x = int(top_pt[0]) - tw // 2
+            label_y = int(top_pt[1]) - 8
+
+            cv2.rectangle(
+                img,
+                (label_x - 2, label_y - th - 2),
+                (label_x + tw + 2, label_y + baseline + 2),
+                (0, 0, 0), -1,
+            )
+            cv2.putText(img, label, (label_x, label_y), font, font_scale, color, thickness)
+
+        # Header with camera name and detection count
+        header = f"{cam_id} | {len(detections)} tag(s) detected"
+        cv2.rectangle(img, (0, 0), (len(header) * 18 + 20, 45), (0, 0, 0), -1)
+        cv2.putText(img, header, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+        out_path = vis_dir / f"{cam_id}.jpg"
+        cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        tag_ids = [d["tag_id"] for d in detections]
+        log.info(f"[{cam_id}] Saved detection vis ({len(detections)} tags: {tag_ids}) -> {out_path.name}")
+
+    log.info(f"Tag detection visualizations -> {vis_dir}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -473,6 +619,7 @@ def main(cfg: DictConfig):
     all_detections: dict[str, list[dict]] = {}
     chain_detections: dict[str, list[dict]] = {}
     all_K: dict[str, np.ndarray] = {}
+    all_dist: dict[str, np.ndarray | None] = {}
 
     for cam_id, cam_cfg in cameras.items():
         cam_id = str(cam_id)
@@ -486,6 +633,7 @@ def main(cfg: DictConfig):
 
         K, cam_params, dist_coeffs = load_intrinsics(cfg, cam_id)
         all_K[cam_id] = K
+        all_dist[cam_id] = dist_coeffs
 
         dets = detect_tags(detector, frame_path, cam_params, tag_size, K, dist_coeffs, undistort=undistort)
         all_detections[cam_id] = dets
@@ -502,7 +650,7 @@ def main(cfg: DictConfig):
     log.info(f"Anchor tag{cfg.anchor.tag_id} pos: {anchor_pose[:3, 3].tolist()}")
 
     # 4. Propagate chain (uses filtered detections, closest known tag only)
-    pose_dict = propagate_chain(cfg, known_tags, chain_detections, all_K, tag_size)
+    pose_dict, node_jumps, node_paths = propagate_chain(cfg, known_tags, chain_detections, all_K, tag_size)
 
     # 5. Validate (uses ALL detections)
     validate(cfg, pose_dict, all_detections)
@@ -522,16 +670,43 @@ def main(cfg: DictConfig):
     with open(out_dir / "all_poses.json", "w") as f:
         json.dump(all_poses, f, indent=2)
 
-    # 8. Summary
+    # 8. Visualize detected tags on images
+    log.info(f"\n{'='*60}")
+    log.info("  TAG DETECTION VISUALIZATION")
+    log.info(f"{'='*60}")
+    visualize_detections(
+        all_detections=all_detections,
+        cameras_cfg=cameras,
+        frames_dir=Path(cfg.data.frames_dir),
+        out_dir=out_dir,
+        K_dict=all_K,
+        dist_dict=all_dist,
+        undistort=undistort,
+    )
+
+    # 9. Chain jump summary
+    log.info(f"\n{'='*60}")
+    log.info("  CHAIN JUMP SUMMARY")
+    log.info(f"{'='*60}")
+    log.info(f"  {'Node':<12} {'Jumps':>5}  Path from anchor")
+    log.info(f"  {'-'*60}")
+    for key in sorted(node_jumps.keys()):
+        jumps = node_jumps[key]
+        path = " -> ".join(node_paths[key])
+        log.info(f"  {key:<12} {jumps:>5}  {path}")
+
+    # 10. Summary
     log.info(f"\n{'='*50}")
     log.info("FINAL WORLD POSITIONS")
     log.info(f"{'='*50}")
     for key in sorted(pose_dict):
         pos = pose_dict[key][:3, 3]
         look = pose_dict[key][:3, 2]
+        jumps = node_jumps.get(key, "?")
         log.info(
             f"  {key:<12} pos=[{pos[0]:7.3f}, {pos[1]:7.3f}, {pos[2]:7.3f}]  "
-            f"look=[{look[0]:6.3f}, {look[1]:6.3f}, {look[2]:6.3f}]"
+            f"look=[{look[0]:6.3f}, {look[1]:6.3f}, {look[2]:6.3f}]  "
+            f"jumps={jumps}"
         )
 
 
