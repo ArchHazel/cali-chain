@@ -172,9 +172,13 @@ def main(cfg: DictConfig):
     log.info(f"Depth frame: {depth_frame.shape}, "
              f"non-zero: {(depth_frame > 0).sum()}/{depth_frame.size}")
 
-    # Back-project and project
+    # Back-project and project (in native Kinect coordinates)
     cam_space, depth_m = backproject_depth(depth_frame, K_depth)
     depth_in_color = project_to_color_dlt(cam_space, depth_m, P)
+
+    # Flip horizontally to match the pre-flipped RGB frames
+    depth_in_color = np.fliplr(depth_in_color)
+
     colored = colorize_depth(depth_in_color)
 
     # Save
@@ -185,15 +189,13 @@ def main(cfg: DictConfig):
     cv2.imwrite(str(out_dir / f"depth_color_{tag}.png"), colored)
     log.info(f"Saved: {out_dir / f'depth_color_{tag}.png'}")
 
-    # Overlay on RGB
+    # Overlay on RGB (already pre-flipped during preprocessing)
     rgb_frame_path = cfg.get("rgb_frame", None)
     if rgb_frame_path:
         rgb = cv2.imread(rgb_frame_path)
         if rgb is None:
             log.warning(f"Could not load {rgb_frame_path}")
         else:
-            # Undo the horizontal flip applied during frame extraction
-            rgb = np.fliplr(rgb).copy()
             if rgb.shape[:2] != (COLOR_H, COLOR_W):
                 rgb = cv2.resize(rgb, (COLOR_W, COLOR_H))
 
