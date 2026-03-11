@@ -1,0 +1,7 @@
+depth_intrinsics:
+  fx: 363.7
+  fy: 365.0
+  cx: 259.3
+  cy: 217.4
+
+depth_to_color_correspondences: configs/kinect/new_correspondences.npz

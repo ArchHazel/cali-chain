@@ -1,5 +1,5 @@
 defaults:
-  - dataset: intrinsic_2
+  - dataset: traj_0
   - _self_
 
 data:

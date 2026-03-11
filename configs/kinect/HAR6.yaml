@@ -1,0 +1,7 @@
+depth_intrinsics:
+  fx: 365.9
+  fy: 370.1
+  cx: 259.4
+  cy: 212.0
+
+depth_to_color_correspondences: configs/kinect/HAR6_correspondences.npz

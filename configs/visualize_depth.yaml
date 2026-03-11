@@ -1,0 +1,18 @@
+defaults:
+  - dataset: calib_3
+  - _self_
+
+cam_id: HAR1
+frame_idx: 0
+chunk: 1
+alpha: 1
+
+# Set to a path to overlay depth on RGB, e.g.:
+#   rgb_frame=null
+rgb_frame: data/${dataset.session}/frames/${cam_id}/000000.jpg
+
+data:
+  depth_dir: data/${dataset.session}/videos
+
+output:
+  dir: output/${dataset.session}/depth_vis
