@@ -1,0 +1,33 @@
+defaults:
+  - _self_
+
+# Session containing 3d_joint_data.json per camera
+data:
+  session: calib_3
+  videos_dir: data/${data.session}/videos
+  joint_filename: "3d_joint_data.json"
+
+# Extrinsics from a (potentially different) calibration session
+extrinsics:
+  session: calib_5
+  dir: output/${extrinsics.session}/extrinsics
+  filename: cam_extrinsics.json
+
+# Ground-truth waypoints for trajectory overlay (x, y in meters)
+# null = no GT overlay
+ground_truth:
+  - [1, 1]
+  - [2, 1]
+  - [2, 3.5]
+  - [6, 3.5]
+  - [2, 3.5]
+  - [2, 6]
+  - [3, 6]
+  - [3, 8]
+  - [3, 6]
+  - [7, 6]
+  - [3, 6]
+  - [3, 3.5]
+
+output:
+  dir: output/${data.session}/world_trajectories

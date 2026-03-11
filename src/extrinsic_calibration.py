@@ -475,7 +475,6 @@ def validate(
             f"mean={np.mean(all_errors):.4f}m  max={np.max(all_errors):.4f}m"
         )
 
-
 # ---------------------------------------------------------------------------
 # Detection visualization
 # ---------------------------------------------------------------------------
@@ -599,7 +598,7 @@ def visualize_detections(
 # Entry point
 # ---------------------------------------------------------------------------
 
-@hydra.main(config_path="../configs", config_name="extrinsic_calibration", version_base=None)
+@hydra.main(config_path="../configs", config_name="extrinsic_calibration_2", version_base=None)
 def main(cfg: DictConfig):
     log.info(f"Extrinsic Calibration Pipeline\n{OmegaConf.to_yaml(cfg)}")
 
@@ -652,7 +651,7 @@ def main(cfg: DictConfig):
     # 4. Propagate chain (uses filtered detections, closest known tag only)
     pose_dict, node_jumps, node_paths = propagate_chain(cfg, known_tags, chain_detections, all_K, tag_size)
 
-    # 5. Validate (uses ALL detections)
+    # 5. Validate based on config
     validate(cfg, pose_dict, all_detections)
 
     # 6. Save camera extrinsics
