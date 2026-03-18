@@ -7,11 +7,13 @@ data:
   videos_dir: data/${data.session}/videos
   joint_filename: "3d_joint_data.json"
 
-# Extrinsics from a (potentially different) calibration session
-extrinsics:
-  session: calib_5
-  dir: output/${extrinsics.session}/extrinsics
-  filename: cam_extrinsics.json
+# Cameras to process (must have entries in HAR_CAMERAS dict)
+cameras:
+  - HAR1
+  - HAR2
+  - HAR3
+  - HAR6
+  - HAR8
 
 # Ground-truth waypoints for trajectory overlay (x, y in meters)
 # null = no GT overlay
@@ -31,4 +33,4 @@ ground_truth:
   - [3, 3.5]
 
 output:
-  dir: output/${data.session}/world_trajectories
+  dir: output/${data.session}/world_trajectories_old

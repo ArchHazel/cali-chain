@@ -1,18 +1,17 @@
 """
-Transform 3D joint data from camera frame to world frame and visualize trajectories.
+Transform 3D joint data from camera frame to world frame using HAR camera
+position + look-at extrinsics (not AprilTag calibration).
 
 Reads:
-  - Extrinsics: output/<ext_session>/extrinsics/cam_extrinsics.json
   - Joint data: data/<data_session>/videos/<cam>/3d_joint_data.json
 
 Writes:
-  - Per-camera world joint data: output/<data_session>/world_trajectories/<cam>/3d_joint_data_world.json
-  - Trajectory plot: output/<data_session>/world_trajectories/trajectory.png
-  - GT path errors: output/<data_session>/world_trajectories/gt_path_errors.json
+  - Per-camera world joint data: output/<data_session>/world_trajectories_har/<cam>/3d_joint_data_world.json
+  - Trajectory plot: output/<data_session>/world_trajectories_har/trajectory.png
 
 Usage:
-    python -m src.trajectory
-    python -m src.trajectory data.session=calib_4 extrinsics.session=calib_4
+    python -m tools.trajectory_har
+    python -m tools.trajectory_har data.session=traj_0
 """
 
 import json
@@ -31,19 +30,75 @@ from omegaconf import DictConfig, OmegaConf
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Hardcoded HAR camera positions
+# A = position (meters), B = look-at point (meters)
+# ---------------------------------------------------------------------------
+
+HAR_CAMERAS = {
+    "HAR1": {"A": [5.03, 8.45, 0.90], "B": [5.73, 8.18, 0.90]},
+    "HAR2": {"A": [0.73, 5.71, 0.90], "B": [1.47, 5.80, 0.90]},
+    "HAR3": {"A": [1.42, 7.75, 0.90], "B": [2.18, 7.79, 0.90]},
+    "HAR4": {"A": [3.72, 0.32, 0.90], "B": [4.27, 0.86, 0.90]},
+    "HAR6": {"A": [4.23, 4.36, 0.90], "B": [3.50, 4.03, 0.90]},
+    "HAR8": {"A": [5.00, 4.00, 0.90], "B": [5.28, 3.52, 0.90]},
+}
+
+
+# ---------------------------------------------------------------------------
+# Extrinsics from look-at
+# ---------------------------------------------------------------------------
+
+def build_extrinsic_from_lookat(position: list, lookat: list) -> np.ndarray:
+    """
+    Build a 4x4 T_world_cam matrix from camera position and look-at point.
+
+    OpenCV camera convention: +Z = forward (into scene), +X = right, +Y = down.
+    World convention: Z = up.
+    """
+    pos = np.array(position, dtype=np.float64)
+    target = np.array(lookat, dtype=np.float64)
+
+    # Camera forward = +Z axis in camera frame
+    forward = target - pos
+    forward = forward / np.linalg.norm(forward)
+
+    # World up
+    world_up = np.array([0.0, 0.0, 1.0])
+
+    # Camera right = +X axis
+    right = np.cross(forward, world_up)
+    if np.linalg.norm(right) < 1e-6:
+        right = np.array([1.0, 0.0, 0.0])
+    right = right / np.linalg.norm(right)
+
+    # Camera down = +Y axis (OpenCV convention: Y points down)
+    down = np.cross(forward, right)
+    down = down / np.linalg.norm(down)
+
+    # T_world_cam: columns are camera axes expressed in world frame
+    T = np.eye(4)
+    T[:3, 0] = right
+    T[:3, 1] = down
+    T[:3, 2] = forward
+    T[:3, 3] = pos
+
+    return T
+
+
+def build_har_extrinsics() -> dict[str, np.ndarray]:
+    """Build T_world_cam for all HAR cameras from position + look-at."""
+    extrinsics = {}
+    for cam_id, params in HAR_CAMERAS.items():
+        extrinsics[cam_id] = build_extrinsic_from_lookat(params["A"], params["B"])
+        log.info(f"[{cam_id}] Built extrinsic: pos={params['A']}, lookat={params['B']}")
+    return extrinsics
+
+
 # ---------------------------------------------------------------------------
 # Transform
 # ---------------------------------------------------------------------------
-
-
-def load_extrinsics(extrinsics_dir: Path, filename: str) -> dict[str, np.ndarray]:
-    ext_path = extrinsics_dir / filename
-    if not ext_path.exists():
-        raise FileNotFoundError(f"Extrinsics not found: {ext_path}")
-    with open(ext_path) as f:
-        data = json.load(f)
-    return {cam: np.array(mat) for cam, mat in data.items()}
-
 
 def transform_to_world(
     points_cam_mm: list[float],
@@ -65,28 +120,20 @@ def transform_to_world(
 
 
 def find_joint_data(
-    cam_key: str,
+    cam_id: str,
     videos_dir: Path,
     joint_filename: str,
 ) -> Path | None:
-    """
-    Find 3d_joint_data.json for a camera.
-    Tries:
-      1. videos/<cam_key>/                     (e.g. camHAR6/)
-      2. videos/<cam_key without 'cam' prefix>/ (e.g. HAR6/)
-    """
-    cam_name = cam_key[3:] if cam_key.startswith("cam") else cam_key
-
-    for name in [cam_key, cam_name]:
+    """Find 3d_joint_data.json for a camera."""
+    for name in [cam_id, f"cam{cam_id}"]:
         p = videos_dir / name / joint_filename
         if p.exists():
             return p
-
     return None
 
 
 def process_camera(
-    cam_key: str,
+    cam_id: str,
     T_world_cam: np.ndarray,
     joint_path: Path,
 ) -> dict[str, list[float]]:
@@ -210,7 +257,6 @@ def log_gt_errors(errors: dict[str, dict]):
 # Visualization
 # ---------------------------------------------------------------------------
 
-
 def visualize_trajectories(
     cam_trajectories: dict[str, np.ndarray],
     ground_truth: list[list[float]] | None,
@@ -228,7 +274,7 @@ def visualize_trajectories(
     pad = 0.5
 
     # --- Top-down XY ---
-    ax_xy.set_title("Top-Down View (XY Plane)", fontsize=14, fontweight="bold")
+    ax_xy.set_title("Top-Down View (XY Plane) — HAR Extrinsics", fontsize=14, fontweight="bold")
     ax_xy.set_xlabel("X (meters)", fontsize=12)
     ax_xy.set_ylabel("Y (meters)", fontsize=12)
 
@@ -297,40 +343,44 @@ def visualize_trajectories(
 # Entry point
 # ---------------------------------------------------------------------------
 
-
-@hydra.main(config_path="../configs", config_name="trajectory", version_base=None)
+@hydra.main(config_path="../configs", config_name="old_trajectory", version_base=None)
 def main(cfg: DictConfig):
-    log.info(f"Transform to World Pipeline\n{OmegaConf.to_yaml(cfg)}")
+    log.info(f"Transform to World (HAR Extrinsics)\n{OmegaConf.to_yaml(cfg)}")
+
+    # Build extrinsics from hardcoded positions
+    cam_extrinsics = build_har_extrinsics()
 
     videos_dir = Path(cfg.data.videos_dir)
-    extrinsics_dir = Path(cfg.extrinsics.dir)
     out_dir = Path(cfg.output.dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load extrinsics
-    cam_extrinsics = load_extrinsics(extrinsics_dir, cfg.extrinsics.filename)
-    log.info(f"Loaded extrinsics for {len(cam_extrinsics)} cameras: {list(cam_extrinsics.keys())}")
+    # Determine which cameras to process
+    cameras = list(cfg.cameras) if "cameras" in cfg else list(HAR_CAMERAS.keys())
 
-    # Process each camera
     cam_trajectories: dict[str, np.ndarray] = {}
 
-    for cam_key, T_world_cam in sorted(cam_extrinsics.items()):
-        log.info(f"\n{'='*50}  {cam_key}  {'='*50}")
+    for cam_id in cameras:
+        log.info(f"\n{'='*50}  {cam_id}  {'='*50}")
 
-        joint_path = find_joint_data(cam_key, videos_dir, cfg.data.joint_filename)
+        T_world_cam = cam_extrinsics.get(cam_id)
+        if T_world_cam is None:
+            log.warning(f"[{cam_id}] No HAR extrinsics defined, skipping")
+            continue
+
+        joint_path = find_joint_data(cam_id, videos_dir, cfg.data.joint_filename)
         if joint_path is None:
-            log.warning(f"[{cam_key}] No joint data found, skipping")
+            log.warning(f"[{cam_id}] No joint data found, skipping")
             continue
 
         log.info(f"  Joint data: {joint_path}")
-        world_data = process_camera(cam_key, T_world_cam, joint_path)
+        world_data = process_camera(cam_id, T_world_cam, joint_path)
 
         if not world_data:
-            log.warning(f"[{cam_key}] No frames in joint data")
+            log.warning(f"[{cam_id}] No frames in joint data")
             continue
 
         # Save
-        cam_out = out_dir / cam_key
+        cam_out = out_dir / cam_id
         cam_out.mkdir(parents=True, exist_ok=True)
         out_path = cam_out / "3d_joint_data_world.json"
         with open(out_path, "w") as f:
@@ -340,7 +390,7 @@ def main(cfg: DictConfig):
         # Collect for visualization
         positions = np.array(list(world_data.values()))
         if len(positions) > 0:
-            cam_trajectories[cam_key] = positions
+            cam_trajectories[cam_id] = positions
 
     # Visualize
     if cam_trajectories:

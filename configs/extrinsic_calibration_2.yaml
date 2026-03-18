@@ -52,19 +52,23 @@ cameras:
     tags: [11, 1, 13, 0, 20, 14]
   new:
     frame: "000000.jpg"
-    tags: [10, 7, 15, 19, 16, 9, 0, 8]
+    # tags: [10, 7, 15, 19, 16, 9, 0, 8]
+    tags: [8, 15, 19, 16, 9, 0]
   HAR2:
     frame: "000000.jpg"
-    tags: [15, 19, 16, 9, 17, 18]
+    tags: [15, 19, 16, 9, 18]
+    # tags: [15, 19, 16, 9, 17, 18]
   HAR1:
     frame: "000000.jpg"
-    tags: [17, 18]
+    tags: [18]
+    # tags: [17, 18]
   HAR3:
     frame: "000000.jpg"
     tags: [16]
   HAR8:
     frame: "000000.jpg"
-    tags: [10, 7, 8]
+    # tags: [10, 7, 8]
+    tags: [8]
 
 # Solve order: each camera is solved using ALL known tags it sees,
 # then all tags it detected are added to the known set.
