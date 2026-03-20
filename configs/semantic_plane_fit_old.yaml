@@ -1,0 +1,21 @@
+defaults:
+  - _self_
+
+session: calib_4
+frames_dir: data/${session}/frames
+frame_name: "000000.jpg"
+
+# Mask2Former Swin-L trained on ADE20K semantic segmentation
+model:
+  name: "facebook/mask2former-swin-large-ade-semantic"
+
+cameras:
+  - HAR1
+  - HAR2
+  - HAR3
+  - HAR6
+  - HAR8
+  - new
+
+output:
+  dir: output/${session}/semantic

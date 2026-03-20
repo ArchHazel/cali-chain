@@ -1,0 +1,32 @@
+defaults:
+  - _self_
+
+# Session to extract planes from
+session: calib_4
+depth_dir: data/${session}/videos
+
+# Which cameras to process
+cameras:
+  - HAR1
+  - HAR2
+  - HAR3
+  - HAR6
+  - HAR8
+  - new
+
+depth:
+  chunk: 1
+  frame_idx: 0
+  num_frames: 5       # accumulate more frames for denser cloud
+  max_depth: 6.0       # meters
+  subsample: 2         # keep every Nth point
+
+# RANSAC plane extraction
+ransac:
+  num_planes: 10        # max planes to extract
+  distance_thresh: 0.03  # 3cm inlier threshold
+  num_iterations: 2000
+  min_inlier_ratio: 0.02  # skip planes with fewer than 2% of remaining points
+
+output:
+  dir: output/${session}/planes

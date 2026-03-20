@@ -1,0 +1,30 @@
+defaults:
+  - _self_
+
+session: calib_4
+depth_dir: data/${session}/videos
+semantic_dir: output/${session}/semantic
+
+cameras:
+  - HAR1
+  - HAR2
+  - HAR3
+  - HAR6
+  - HAR8
+  - new
+
+depth:
+  chunk: 1
+  frame_idx: 0
+  num_frames: 10
+  max_depth: 8.0
+
+ransac:
+  distance_thresh: 0.03
+  num_iterations: 2000
+  min_inlier_ratio: 0.02
+
+max_walls: 3
+
+output:
+  dir: output/${session}/semantic_planes
