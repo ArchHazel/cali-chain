@@ -1,0 +1,28 @@
+defaults:
+  - _self_
+
+# Reference session (new, has extrinsics)
+reference:
+  session: calib_4
+  planes_dir: output/${reference.session}/semantic_planes
+  extrinsics_dir: output/${reference.session}/extrinsics
+  extrinsics_filename: cam_extrinsics.json
+
+# Target session (old, no extrinsics — we want to recover these)
+target:
+  session: traj_0
+  planes_dir: output/${target.session}/semantic_planes
+
+cameras:
+  - HAR1
+  - HAR2
+  - HAR3
+  - HAR6
+  - HAR8
+  - new
+
+matching:
+  angle_thresh_deg: 30.0
+
+output:
+  dir: output/cross_session_solve_${reference.session}_${target.session}

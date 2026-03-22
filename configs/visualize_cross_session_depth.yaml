@@ -3,7 +3,7 @@ defaults:
 
 # Reference session (has extrinsics)
 reference:
-  session: calib_5
+  session: calib_4
   extrinsics_dir: output/${reference.session}/extrinsics
   extrinsics_filename: cam_extrinsics.json
   depth_dir: data/${reference.session}/videos
@@ -12,6 +12,14 @@ reference:
 target:
   session: traj_0
   depth_dir: data/${target.session}/videos
+  # Path to recovered extrinsics from cross_session_solve.py
+  # Set to null to use reference extrinsics (assumes no camera movement)
+  extrinsics_dir: output/cross_session_solve_${reference.session}_${target.session}
+  extrinsics_filename: recovered_extrinsics.json
+
+  # test against new intrinsics
+  # extrinsics_dir: output/${reference.session}/extrinsics
+  # extrinsics_filename: cam_extrinsics.json
 
 # Cameras to compare (must exist in both sessions)
 cameras:

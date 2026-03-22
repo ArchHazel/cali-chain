@@ -491,9 +491,12 @@ def main(cfg: DictConfig):
                                      cfg.reference.extrinsics_filename)
     log.info(f"Loaded ref extrinsics for: {list(ref_extrinsics.keys())}")
 
-    # Build target extrinsics from hardcoded HAR camera positions
-    tgt_extrinsics = build_har_extrinsics()
-    log.info(f"Built target extrinsics for: {list(tgt_extrinsics.keys())}")
+    if cfg.target.get("extrinsics_dir") and cfg.target.get("extrinsics_filename"):
+        tgt_extrinsics = load_extrinsics(cfg.target.extrinsics_dir, cfg.target.extrinsics_filename)
+        log.info(f"Loaded target extrinsics from file: {list(tgt_extrinsics.keys())}")
+    else:
+        tgt_extrinsics = build_har_extrinsics()
+        log.info(f"Using hardcoded HAR extrinsics: {list(tgt_extrinsics.keys())}")
 
     # Derive frames directories from session names
     ref_frames_dir = f"data/{cfg.reference.session}/frames"
@@ -510,10 +513,16 @@ def main(cfg: DictConfig):
             if key in ref_extrinsics:
                 T_ref = ref_extrinsics[key]
                 break
-
-        # Find target extrinsics key
-        T_tgt = tgt_extrinsics.get(cam_id)
-
+        
+        T_tgt = None
+        if cfg.target.get("extrinsics_dir") and cfg.target.get("extrinsics_filename"):
+            for key in [cam_id, f"cam{cam_id}"]:
+                if key in tgt_extrinsics:
+                    T_tgt = tgt_extrinsics[key]
+                    break
+        else:
+            T_tgt = tgt_extrinsics.get(cam_id)
+        
         if T_ref is None and T_tgt is None:
             log.warning(f"[{cam_id}] No extrinsics found for either session, skipping")
             continue

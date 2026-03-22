@@ -1,7 +1,7 @@
 defaults:
   - _self_
 
-session: calib_4
+session: traj_0
 frames_dir: data/${session}/frames
 frame_name: "000000.jpg"
 
