@@ -17,8 +17,8 @@ Prerequisites:
     - Extrinsic calibration run on the session (for ground truth)
 
 Usage:
-    python -m tools.cross_camera_comparison
-    python -m tools.cross_camera_comparison session=calib_4 cam_ref=HAR2 cam_tgt=HAR3
+    python -m recovery.cross_camera_comparison
+    python -m recovery.cross_camera_comparison session=calib_4 cam_ref=HAR2 cam_tgt=HAR3
 """
 
 import json
@@ -87,6 +87,12 @@ def load_planes(planes_dir: str, cam_id: str) -> dict:
         data = json.load(f)
     for key, plane in data.items():
         plane["normal"] = np.array(plane["normal"])
+        if "centroid" in plane:
+            plane["centroid"] = np.array(plane["centroid"])
+        if "axis_0" in plane:
+            plane["axis_0"] = np.array(plane["axis_0"])
+        if "axis_1" in plane:
+            plane["axis_1"] = np.array(plane["axis_1"])
     return data
 
 
@@ -210,8 +216,7 @@ def run_icp(source_pts, target_pts, max_correspondence_distance=0.5,
 
 
 # ---------------------------------------------------------------------------
-# Plane matching (adapted for cross-camera: no label-based floor match,
-# all planes matched by brute force since labels are per-camera)
+# Plane matching (adapted for cross-camera)
 # ---------------------------------------------------------------------------
 
 def normalize(v):
@@ -265,10 +270,75 @@ def count_independent_directions(matches, parallel_thresh_deg=15.0):
     return len(directions)
 
 
+# ---------------------------------------------------------------------------
+# Scoring: Bounded point-to-plane (primary)
+# ---------------------------------------------------------------------------
+
+def score_assignment_bounded(candidate, ref_planes, tgt_pts,
+                             plane_dist_thresh=0.05, extent_margin=1.2):
+    """
+    Score by bounded point-to-plane: raw inlier count (not ratio).
+    A point is an inlier if perpendicular-close AND within the oriented
+    bounding rectangle on the plane surface.
+    """
+    n_dirs = count_independent_directions(candidate)
+    if n_dirs < 2:
+        return float("inf"), {}
+
+    R = solve_rotation(candidate)
+    if n_dirs >= 3:
+        t = solve_translation_full(candidate, R)
+    else:
+        t = solve_translation_constrained(candidate, R)
+
+    tgt_transformed = (R @ tgt_pts.T).T + t
+
+    total_inliers = 0
+    for label, plane in ref_planes.items():
+        n = plane["normal"]
+        centroid = plane["centroid"]
+        axis_0 = plane["axis_0"]
+        axis_1 = plane["axis_1"]
+        extent_0 = plane["extent_0"]
+        extent_1 = plane["extent_1"]
+        rho = plane["rho"]
+
+        perp_dist = np.abs(tgt_transformed @ n - rho)
+        close_mask = perp_dist < plane_dist_thresh
+
+        if not close_mask.any():
+            continue
+
+        close_pts = tgt_transformed[close_mask]
+        offsets = close_pts - centroid
+        d0 = np.abs(offsets @ axis_0)
+        d1 = np.abs(offsets @ axis_1)
+        bounded_mask = (d0 < extent_0 * extent_margin) & (d1 < extent_1 * extent_margin)
+
+        total_inliers += bounded_mask.sum()
+
+    rot_deg = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    trans_m = float(np.linalg.norm(t))
+
+    info = {
+        "n_planes": len(candidate),
+        "n_dirs": n_dirs,
+        "rot_deg": rot_deg,
+        "trans_m": trans_m,
+        "total_inliers": int(total_inliers),
+    }
+
+    return -total_inliers, info
+
+
+# ---------------------------------------------------------------------------
+# Scoring: KDTree point cloud fitness (fallback)
+# ---------------------------------------------------------------------------
+
 def score_assignment_fitness(candidate, ref_pts, tgt_pts, max_corr_dist=0.5):
     """
-    Score by point cloud fitness: solve R,t from planes, transform target
-    points, measure fraction within max_corr_dist of reference points.
+    Score by KDTree point cloud fitness (fallback for old plane JSONs
+    without centroid/radius).
     """
     from scipy.spatial import cKDTree
 
@@ -304,6 +374,10 @@ def score_assignment_fitness(candidate, ref_pts, tgt_pts, max_corr_dist=0.5):
     return -fitness, info
 
 
+# ---------------------------------------------------------------------------
+# Cross-camera plane matching
+# ---------------------------------------------------------------------------
+
 def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
                               angle_thresh_deg=90.0, max_corr_dist=0.5):
     """
@@ -315,6 +389,8 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
 
     angle_thresh_deg only applies to wall matching (high threshold since
     cameras on different walls see walls from very different angles).
+
+    Uses bounded plane scoring if available, falls back to KDTree fitness.
     """
     cos_thresh = np.cos(np.radians(angle_thresh_deg))
 
@@ -381,7 +457,14 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
                 "valid": dot > cos_thresh,
             }
 
-    # Enumerate wall assignments
+    # Check if bounded planes are available
+    has_bounds = all("centroid" in p and "axis_0" in p for p in ref_planes.values())
+    if has_bounds:
+        log.info(f"    Scoring by bounded point-to-plane ({len(tgt_pts)} tgt points)")
+    else:
+        log.info(f"    Scoring by KDTree fitness ({len(ref_pts)} ref, {len(tgt_pts)} tgt points)")
+
+    # Enumerate all possible assignments
     n_ref = len(ref_keys)
     tgt_options = tgt_keys + [None] * n_ref
 
@@ -394,18 +477,17 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
         used_tgt = [t for t in perm if t is not None]
         if len(used_tgt) != len(set(used_tgt)):
             continue
-        key = tuple(perm)
-        if key in seen:
-            continue
-        seen.add(key)
 
+        # Build assignment, filtering out invalid (angle too large) pairs
         wall_matches = []
+        valid_pairs = []
         for rk, tk in zip(ref_keys, perm):
             if tk is None:
                 continue
             info = pair_info[(rk, tk)]
             if not info["valid"]:
                 continue
+            valid_pairs.append((rk, tk))
             wall_matches.append({
                 "label": f"{rk}<->{tk}",
                 "ref_normal": info["ref_normal"],
@@ -414,6 +496,12 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
                 "tgt_rho": info["tgt_rho"],
                 "dot": info["dot"],
             })
+
+        # Deduplicate by actual surviving pairs after validity filtering
+        key = tuple(sorted(valid_pairs))
+        if key in seen:
+            continue
+        seen.add(key)
 
         # Score: fixed matches + this wall assignment
         candidate = fixed_matches + wall_matches
@@ -424,9 +512,14 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
         if n_dirs < 2:
             continue
 
-        # Score by point cloud fitness
-        score, info = score_assignment_fitness(candidate, ref_pts, tgt_pts,
-                                               max_corr_dist=max_corr_dist)
+        if has_bounds:
+            score, info = score_assignment_bounded(
+                candidate, ref_planes, tgt_pts,
+                plane_dist_thresh=max_corr_dist, extent_margin=1.2)
+        else:
+            score, info = score_assignment_fitness(
+                candidate, ref_pts, tgt_pts, max_corr_dist=max_corr_dist)
+
         if score < float("inf"):
             info["walls"] = wall_matches
             top_candidates.append({"score": score, **info})
@@ -439,7 +532,11 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
     top_candidates.sort(key=lambda x: x["score"])
     for rank, c in enumerate(top_candidates[:5]):
         labels = [m["label"] for m in c["walls"]]
-        log.info(f"    #{rank+1} fitness={c['fitness']:.4f}  rmse={c['inlier_rmse']:.4f}m  "
+        if "total_inliers" in c:
+            metric = f"inliers={c['total_inliers']}"
+        else:
+            metric = f"fitness={c['fitness']:.4f}  rmse={c['inlier_rmse']:.4f}m"
+        log.info(f"    #{rank+1} {metric}  "
                  f"planes={c['n_planes']}  dirs={c['n_dirs']}  "
                  f"rot={c['rot_deg']:.2f}°  trans={c['trans_m']:.4f}m  "
                  f"walls={labels}")

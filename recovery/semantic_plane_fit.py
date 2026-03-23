@@ -10,15 +10,15 @@ Pipeline:
   3. Project depth points into RGB space via DLT
   4. Look up each depth point's semantic label from the mask
   5. Fit planes (via RANSAC) to each structural class separately
-  6. Output per-camera plane parameters (normal + rho) and visualization
+  6. Output per-camera plane parameters (normal + rho + centroid + radius) and visualization
 
 Prerequisites:
     Run semantic_planes.py first to generate the masks.
 
 Usage:
-    python -m tools.semantic_plane_fit
-    python -m tools.semantic_plane_fit session=calib_5
-    python -m tools.semantic_plane_fit session=calib_5 cameras='[HAR1,HAR6]'
+    python -m recovery.semantic_plane_fit
+    python -m recovery.semantic_plane_fit session=calib_5
+    python -m recovery.semantic_plane_fit session=calib_5 cameras='[HAR1,HAR6]'
 """
 
 import json
@@ -206,6 +206,48 @@ def fit_plane_ransac(points: np.ndarray, distance_thresh: float = 0.03,
     return best_normal, rho, best_inliers
 
 
+def compute_plane_bounds(points: np.ndarray, inlier_mask: np.ndarray,
+                         normal: np.ndarray) -> dict:
+    """
+    Compute centroid and oriented bounding rectangle from RANSAC inliers.
+
+    Projects inlier points onto the plane surface (removing the normal
+    component), then runs PCA to find the two principal spread directions.
+    Half-extents are the 95th-percentile distance along each axis.
+
+    This produces an oriented bounding rectangle instead of a circle,
+    which better captures elongated shapes like walls (wide but short)
+    or pillars (narrow but tall).
+
+    Returns dict with: centroid, axis_0, axis_1, extent_0, extent_1.
+    """
+    inlier_pts = points[inlier_mask]
+    centroid = inlier_pts.mean(axis=0)
+    offsets = inlier_pts - centroid
+    # Remove normal component to get on-plane displacement
+    normal_component = offsets @ normal
+    on_plane = offsets - np.outer(normal_component, normal)
+
+    # PCA on on-plane displacements to get principal axes
+    _, _, Vt = np.linalg.svd(on_plane, full_matrices=False)
+    axis_0 = Vt[0]  # primary spread direction
+    axis_1 = Vt[1]  # secondary spread direction
+
+    # Half-extents along each axis (95th percentile)
+    proj_0 = np.abs(on_plane @ axis_0)
+    proj_1 = np.abs(on_plane @ axis_1)
+    extent_0 = float(np.percentile(proj_0, 95))
+    extent_1 = float(np.percentile(proj_1, 95))
+
+    return {
+        "centroid": centroid,
+        "axis_0": axis_0,
+        "axis_1": axis_1,
+        "extent_0": extent_0,
+        "extent_1": extent_1,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
@@ -214,6 +256,12 @@ def plot_semantic_planes(points: np.ndarray, labels: np.ndarray,
                          planes: dict, cam_id: str, out_path: Path):
     """Three-view plot with points colored by semantic class + plane fits."""
     fig, axes = plt.subplots(1, 3, figsize=(24, 7), facecolor="black")
+
+    # Flip X for visualization to match the horizontally flipped RGB convention.
+    # Plane fitting uses native Y-up Kinect frame (no X flip), but the plots
+    # should match the pre-flipped RGB frames for visual consistency.
+    points = points.copy()
+    points[:, 0] = -points[:, 0]
 
     WALL_COLORS_VIS = ["#3498db", "#1abc9c", "#9b59b6"]  # blue, teal, purple
     colors = np.full(len(points), "#333333")  # dark gray for unlabeled/other
@@ -257,10 +305,6 @@ def plot_semantic_planes(points: np.ndarray, labels: np.ndarray,
         ax.set_aspect("equal")
         ax.tick_params(colors="white")
         ax.grid(True, alpha=0.2, color="white")
-
-        # Invert X axis so visualization matches horizontally flipped RGB
-        if a0 == 0:  # X is on horizontal axis
-            ax.invert_xaxis()
 
     # Legend
     WALL_COLORS = ["#3498db", "#1abc9c", "#9b59b6"]  # blue, teal, purple for wall_0, wall_1, wall_2
@@ -427,14 +471,17 @@ def main(cfg: DictConfig):
                 continue
 
             n_inliers = inlier_mask.sum()
+            bounds = compute_plane_bounds(class_pts, inlier_mask, normal)
             planes[class_name] = {
                 "normal": normal,
                 "rho": float(rho),
                 "num_inliers": int(n_inliers),
                 "inlier_ratio": float(n_inliers / len(class_pts)),
+                **bounds,
             }
             log.info(f"  {class_name}: normal=[{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]  "
-                     f"ρ={rho:.3f}m  inliers={n_inliers} ({n_inliers/len(class_pts):.0%})")
+                     f"ρ={rho:.3f}m  inliers={n_inliers} ({n_inliers/len(class_pts):.0%})  "
+                     f"extents={bounds['extent_0']:.3f}x{bounds['extent_1']:.3f}m")
 
         # Walls: iterative extraction
         # Track global indices of wall points so we can relabel them
@@ -464,14 +511,17 @@ def main(cfg: DictConfig):
                 break
 
             key = f"wall_{wall_idx}"
+            bounds = compute_plane_bounds(remaining_pts, inlier_mask, normal)
             planes[key] = {
                 "normal": normal,
                 "rho": float(rho),
                 "num_inliers": int(n_inliers),
                 "inlier_ratio": float(inlier_ratio),
+                **bounds,
             }
             log.info(f"  {key}: normal=[{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]  "
-                     f"ρ={rho:.3f}m  inliers={n_inliers} ({inlier_ratio:.0%})")
+                     f"ρ={rho:.3f}m  inliers={n_inliers} ({inlier_ratio:.0%})  "
+                     f"extents={bounds['extent_0']:.3f}x{bounds['extent_1']:.3f}m")
 
             # Relabel inlier points in all_labels
             remaining_indices = np.where(remaining_mask)[0]
@@ -499,6 +549,11 @@ def main(cfg: DictConfig):
                     "rho": plane["rho"],
                     "num_inliers": plane["num_inliers"],
                     "inlier_ratio": plane["inlier_ratio"],
+                    "centroid": plane["centroid"].tolist(),
+                    "axis_0": plane["axis_0"].tolist(),
+                    "axis_1": plane["axis_1"].tolist(),
+                    "extent_0": plane["extent_0"],
+                    "extent_1": plane["extent_1"],
                 }
         with open(out_dir / f"{cam_id}_planes.json", "w") as f:
             json.dump(plane_data, f, indent=2)

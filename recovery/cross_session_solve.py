@@ -6,7 +6,7 @@ and solves for the rigid transform (R, t) that maps the old session's
 camera frame to the new session's camera frame.
 
 Pipeline:
-  1. Load plane parameters (normal + rho) from both sessions
+  1. Load plane parameters (normal + rho + centroid + radius) from both sessions
   2. Match planes by semantic label and closest normal direction
   3. Solve rotation via SVD on matched normals
   4. Solve translation via linear system from matched rho values
@@ -14,20 +14,26 @@ Pipeline:
   6. Combine with new session extrinsics to recover old session world poses
 
 Scoring:
-  Wall assignments are scored using leave-one-out cross-validation on rho.
-  For each candidate assignment, each plane is held out in turn, R and t
-  are solved from the remaining planes, and the held-out plane's rho is
-  predicted. The median prediction error is the score. This disambiguates
-  parallel walls (which produce identical normal residuals) by testing
-  whether the translation derived from the other planes correctly predicts
-  each wall's distance.
+  Wall assignments are scored using bounded point-to-plane distance.
+  Each candidate's R and t transform the target point cloud; points are
+  counted as inliers only if they are both perpendicular-close to a
+  reference plane AND within the spatial bounds (centroid + radius) of
+  where that plane was actually observed. This disambiguates parallel
+  walls: the wrong assignment puts points at correct perpendicular distance
+  but far from the plane's observed spatial extent.
+
+  Score is raw inlier count (not a ratio), so points outside any plane's
+  bounds are simply ignored rather than penalized.
+
+  Falls back to KDTree point cloud fitness if planes lack centroid/radius
+  (backward compatibility with old plane JSONs).
 
 Prerequisites:
     Run semantic_plane_fit.py on both sessions first.
 
 Usage:
-    python -m tools.cross_session_solve
-    python -m tools.cross_session_solve reference.session=calib_5 target.session=calib_3
+    python -m recovery.cross_session_solve
+    python -m recovery.cross_session_solve reference.session=calib_5 target.session=calib_3
 """
 
 import json
@@ -63,6 +69,12 @@ def load_planes(planes_dir: str, cam_id: str) -> dict:
         data = json.load(f)
     for key, plane in data.items():
         plane["normal"] = np.array(plane["normal"])
+        if "centroid" in plane:
+            plane["centroid"] = np.array(plane["centroid"])
+        if "axis_0" in plane:
+            plane["axis_0"] = np.array(plane["axis_0"])
+        if "axis_1" in plane:
+            plane["axis_1"] = np.array(plane["axis_1"])
     return data
 
 
@@ -227,18 +239,16 @@ def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict,
         if len(used_tgt) != len(set(used_tgt)):
             continue
 
-        key = tuple(perm)
-        if key in seen:
-            continue
-        seen.add(key)
-
+        # Build assignment, filtering out invalid (angle too large) pairs
         assignment = []
+        valid_pairs = []
         for rk, tk in zip(ref_keys, perm):
             if tk is None:
                 continue
             info = pair_info[(rk, tk)]
             if not info["valid"]:
                 continue
+            valid_pairs.append((rk, tk))
             assignment.append({
                 "label": f"{rk}<->{tk}",
                 "ref_normal": info["ref_normal"],
@@ -247,6 +257,14 @@ def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict,
                 "tgt_rho": info["tgt_rho"],
                 "dot": info["dot"],
             })
+
+        # Deduplicate by the actual surviving pairs after validity filtering.
+        # Different permutations can produce the same effective assignment
+        # when unmatched (None) or invalid pairs differ.
+        key = tuple(sorted(valid_pairs))
+        if key in seen:
+            continue
+        seen.add(key)
 
         assignments.append(assignment)
 
@@ -329,22 +347,93 @@ def solve_translation_constrained(matches: list[dict], R: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Scoring: Point cloud fitness
+# Scoring: Bounded point-to-plane (primary)
+# ---------------------------------------------------------------------------
+
+def score_assignment_bounded(candidate: list[dict], ref_planes: dict,
+                             tgt_pts: np.ndarray,
+                             plane_dist_thresh: float = 0.05,
+                             extent_margin: float = 1.2) -> tuple[float, dict]:
+    """
+    Score a wall assignment using bounded point-to-plane distance.
+
+    For each reference plane, a transformed target point is an inlier only if:
+      1. Perpendicular distance to the plane < plane_dist_thresh
+      2. On-plane projection falls within the oriented bounding rectangle
+         (centroid + axis_0/axis_1 + extent_0/extent_1) with margin
+
+    Uses an oriented bounding rectangle instead of a circle, which better
+    captures elongated shapes like walls and pillars.
+
+    Returns: (score, info_dict) where score is negative inlier count (lower=better).
+    """
+    n_dirs = count_independent_directions(candidate)
+    if n_dirs < 2:
+        return float("inf"), {}
+
+    R = solve_rotation(candidate)
+    if n_dirs >= 3:
+        t = solve_translation_full(candidate, R)
+    else:
+        t = solve_translation_constrained(candidate, R)
+
+    # Transform target points into reference frame
+    tgt_transformed = (R @ tgt_pts.T).T + t
+
+    # Count inliers across all reference planes
+    total_inliers = 0
+    for label, plane in ref_planes.items():
+        n = plane["normal"]
+        centroid = plane["centroid"]
+        axis_0 = plane["axis_0"]
+        axis_1 = plane["axis_1"]
+        extent_0 = plane["extent_0"]
+        extent_1 = plane["extent_1"]
+        rho = plane["rho"]
+
+        # 1. Perpendicular distance to infinite plane
+        perp_dist = np.abs(tgt_transformed @ n - rho)
+        close_mask = perp_dist < plane_dist_thresh
+
+        if not close_mask.any():
+            continue
+
+        # 2. Project onto plane axes, check within oriented bounding rect
+        close_pts = tgt_transformed[close_mask]
+        offsets = close_pts - centroid
+        d0 = np.abs(offsets @ axis_0)
+        d1 = np.abs(offsets @ axis_1)
+        bounded_mask = (d0 < extent_0 * extent_margin) & (d1 < extent_1 * extent_margin)
+
+        total_inliers += bounded_mask.sum()
+
+    rot_deg = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    trans_m = float(np.linalg.norm(t))
+
+    info = {
+        "n_planes": len(candidate),
+        "n_dirs": n_dirs,
+        "rot_deg": rot_deg,
+        "trans_m": trans_m,
+        "total_inliers": int(total_inliers),
+    }
+
+    score = -total_inliers  # more inliers = lower score = better
+    return score, info
+
+
+# ---------------------------------------------------------------------------
+# Scoring: KDTree point cloud fitness (fallback)
 # ---------------------------------------------------------------------------
 
 def score_assignment_fitness(candidate: list[dict],
-                             ref_pts: np.ndarray,
-                             tgt_pts: np.ndarray,
+                             ref_pts: np.ndarray, tgt_pts: np.ndarray,
                              max_corr_dist: float = 0.1) -> tuple[float, dict]:
     """
-    Score a plane assignment by solving R and t, transforming target points,
-    and measuring nearest-neighbor fitness against reference points.
+    Score by KDTree point cloud fitness (fallback for old plane JSONs
+    without centroid/radius).
 
-    This directly measures alignment quality — no arbitrary constants,
-    no scale mismatch between different scoring methods.
-
-    Returns: (score, info_dict) where score is negative fitness (lower=better)
-    and info_dict has the solve details.
+    Returns: (score, info_dict) where score is negative fitness (lower=better).
     """
     from scipy.spatial import cKDTree
 
@@ -380,7 +469,6 @@ def score_assignment_fitness(candidate: list[dict],
         "inlier_rmse": inlier_rmse,
     }
 
-    # Score: negative fitness (we want highest fitness = lowest score)
     score = -fitness
     return score, info
 
@@ -398,12 +486,11 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
 
     Strategy:
       - floor<->floor: direct match by label
-      - walls: brute-force all valid assignments, score by point cloud fitness
+      - walls: brute-force all valid assignments, score by bounded plane fitness
       - ceiling excluded (unreliable detection in most cameras)
 
-    Scoring: each candidate assignment's R and t are used to transform the
-    target point cloud. The assignment producing the best alignment (highest
-    fitness) with the reference point cloud wins. No arbitrary constants.
+    Scoring: if planes have centroid/radius (bounded planes), uses fast
+    bounded point-to-plane scoring. Otherwise falls back to KDTree fitness.
 
     Returns list of matched pairs with aligned normals and rho values.
     """
@@ -417,9 +504,15 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
     # Enumerate all valid wall assignments
     assignments = enumerate_wall_assignments(ref_planes, tgt_planes, angle_thresh_deg)
     log.info(f"  Evaluating {len(assignments)} wall assignments...")
-    log.info(f"  Scoring by point cloud fitness ({len(ref_pts)} ref, {len(tgt_pts)} tgt points)")
 
-    # Score each assignment by point cloud fitness
+    # Check if bounded planes are available
+    has_bounds = all("centroid" in p and "axis_0" in p for p in ref_planes.values())
+    if has_bounds:
+        log.info(f"  Scoring by bounded point-to-plane ({len(tgt_pts)} tgt points)")
+    else:
+        log.info(f"  Scoring by KDTree fitness ({len(ref_pts)} ref, {len(tgt_pts)} tgt points)")
+
+    # Score each assignment
     best_score = float("inf")
     best_walls = []
     all_scored = []
@@ -433,7 +526,14 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
         if n_dirs < 2:
             continue
 
-        score, info = score_assignment_fitness(candidate, ref_pts, tgt_pts, max_corr_dist)
+        if has_bounds:
+            score, info = score_assignment_bounded(
+                candidate, ref_planes, tgt_pts,
+                plane_dist_thresh=max_corr_dist, extent_margin=1.2)
+        else:
+            score, info = score_assignment_fitness(
+                candidate, ref_pts, tgt_pts, max_corr_dist)
+
         if score < float("inf"):
             info["walls"] = wall_matches
             info["mean_drho"] = float(np.mean([abs(m["ref_rho"] - m["tgt_rho"]) for m in candidate]))
@@ -447,7 +547,11 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
     all_scored.sort(key=lambda x: x["score"])
     for rank, c in enumerate(all_scored[:5]):
         labels = [m["label"] for m in c["walls"]]
-        log.info(f"  #{rank+1} fitness={c['fitness']:.4f}  rmse={c['inlier_rmse']:.4f}m  "
+        if "total_inliers" in c:
+            metric = f"inliers={c['total_inliers']}"
+        else:
+            metric = f"fitness={c['fitness']:.4f}"
+        log.info(f"  #{rank+1} {metric}  "
                  f"planes={c['n_planes']}  dirs={c['n_dirs']}  "
                  f"rot={c['rot_deg']:.2f}°  trans={c['trans_m']:.4f}m  "
                  f"walls={labels}")
@@ -578,7 +682,7 @@ def main(cfg: DictConfig):
         log.info(f"  Reference planes: {list(ref_planes.keys())}")
         log.info(f"  Target planes:    {list(tgt_planes.keys())}")
 
-        # Load depth points for fitness scoring
+        # Load depth points for scoring
         try:
             kinect = load_kinect_config(cam_id)
         except FileNotFoundError:
