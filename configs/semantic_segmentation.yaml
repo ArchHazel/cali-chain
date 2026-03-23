@@ -5,9 +5,9 @@ session: traj_0
 frames_dir: data/${session}/frames
 frame_name: "000000.jpg"
 
-# Mask2Former Swin-L trained on ADE20K semantic segmentation
+# trained on ADE20K semantic segmentation
 model:
-  name: "facebook/mask2former-swin-large-ade-semantic"
+  name: "oneformer"
 
 cameras:
   - HAR1

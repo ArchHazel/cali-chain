@@ -1,0 +1,30 @@
+defaults:
+  - _self_
+
+session: calib_4
+depth_dir: data/${session}/videos
+planes_dir: output/${session}/semantic_planes
+extrinsics_dir: output/${session}/extrinsics
+extrinsics_filename: cam_extrinsics.json
+
+# Camera pair to compare
+cam_ref: HAR2
+cam_tgt: HAR3
+
+depth:
+  chunk: 1
+  frame_idx: 0
+  num_frames: 10
+  max_depth: 8.0
+  subsample: 8
+
+matching:
+  # High threshold for cross-camera (cameras on different walls)
+  angle_thresh_deg: 90.0
+
+icp:
+  # Larger max_corr_dist for cross-camera (less overlap expected)
+  max_corr_dist: 0.5
+
+output:
+  dir: output/cross_camera_${cam_ref}_${cam_tgt}_${session}

@@ -1,0 +1,40 @@
+defaults:
+  - _self_
+
+# Reference session (new, has extrinsics + semantic masks)
+reference:
+  session: calib_4
+  depth_dir: data/${reference.session}/videos
+  semantic_dir: output/${reference.session}/semantic
+  extrinsics_dir: output/${reference.session}/extrinsics
+  extrinsics_filename: cam_extrinsics.json
+
+# Target session (old, no extrinsics)
+target:
+  session: traj_0
+  depth_dir: data/${target.session}/videos
+  semantic_dir: output/${target.session}/semantic
+
+# Plane solve results for comparison
+plane_solve:
+  results_dir: output/cross_session_solve_${reference.session}_${target.session}
+
+cameras:
+  - HAR1
+  - HAR2
+  - HAR3
+  - HAR6
+  - HAR8
+
+depth:
+  chunk: 1
+  frame_idx: 0
+  num_frames: 10
+  max_depth: 8.0
+  subsample: 4
+
+icp:
+  max_corr_dist: 0.1  # meters, max correspondence distance for ICP
+
+output:
+  dir: output/icp_comparison_${reference.session}_${target.session}

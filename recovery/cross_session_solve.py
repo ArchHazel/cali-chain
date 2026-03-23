@@ -36,6 +36,7 @@ from pathlib import Path
 from itertools import permutations
 
 import numpy as np
+import yaml
 
 import matplotlib
 matplotlib.use("Agg")
@@ -45,6 +46,8 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 log = logging.getLogger(__name__)
+
+DEPTH_W, DEPTH_H = 512, 424
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +73,65 @@ def load_extrinsics(extrinsics_dir: str, filename: str) -> dict[str, np.ndarray]
     with open(path) as f:
         data = json.load(f)
     return {cam: np.array(mat) for cam, mat in data.items()}
+
+
+def load_kinect_config(cam_id: str, configs_dir: str = "configs/kinect") -> dict:
+    config_path = Path(configs_dir) / f"{cam_id}.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Kinect config not found: {config_path}")
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    di = cfg["depth_intrinsics"]
+    K = np.array([
+        [di["fx"], 0.0, di["cx"]],
+        [0.0, di["fy"], di["cy"]],
+        [0.0, 0.0, 1.0]
+    ])
+    return {"K_depth": K}
+
+
+def load_depth_frames(depth_dir: str, cam_id: str, chunk: int,
+                      start_frame: int, num_frames: int) -> list[np.ndarray]:
+    depth_path = Path(depth_dir) / cam_id / "depth" / f"depth_{chunk}.npy"
+    if not depth_path.exists():
+        return []
+    depth_chunk = np.load(depth_path)
+    end_frame = min(start_frame + num_frames, depth_chunk.shape[0])
+    return [depth_chunk[i] for i in range(start_frame, end_frame)]
+
+
+def backproject_depth(depth_frame: np.ndarray, K: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project to 3D in Y-up Kinect camera space."""
+    H, W = depth_frame.shape
+    cam = np.zeros((H, W, 3), dtype=np.float32)
+    cam[:, :, 0] = np.arange(W)
+    cam[:, :, 1] = np.arange(H - 1, -1, -1)[:, np.newaxis]
+    cam[:, :, 2] = 1.0
+    cam_flat = cam.reshape(-1, 3)
+    cam_flat = (np.linalg.inv(K) @ cam_flat.T).T
+    depth_m = depth_frame.flatten().astype(np.float32) * 0.001
+    cam_flat *= depth_m[:, np.newaxis]
+    valid = depth_m > 0
+    return cam_flat[valid], depth_m[valid]
+
+
+def accumulate_points(depth_dir: str, cam_id: str, K_depth: np.ndarray,
+                      chunk: int, frame_idx: int, num_frames: int,
+                      max_depth: float, subsample: int) -> np.ndarray:
+    """Accumulate depth points in Y-up camera frame. Returns Nx3."""
+    frames = load_depth_frames(depth_dir, cam_id, chunk, frame_idx, num_frames)
+    if not frames:
+        return np.zeros((0, 3))
+    all_pts = []
+    for depth_frame in frames:
+        pts, depths = backproject_depth(depth_frame, K_depth)
+        pts = pts[depths < max_depth]
+        if subsample > 1:
+            pts = pts[::subsample]
+        all_pts.append(pts)
+    if not all_pts:
+        return np.zeros((0, 3))
+    return np.concatenate(all_pts, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -267,68 +329,60 @@ def solve_translation_constrained(matches: list[dict], R: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Scoring: Leave-one-out cross-validation on rho
+# Scoring: Point cloud fitness
 # ---------------------------------------------------------------------------
 
-def score_assignment_loo(candidate: list[dict]) -> float:
+def score_assignment_fitness(candidate: list[dict],
+                             ref_pts: np.ndarray,
+                             tgt_pts: np.ndarray,
+                             max_corr_dist: float = 0.1) -> tuple[float, dict]:
     """
-    Score a plane assignment using leave-one-out cross-validation on rho,
-    with a small Δρ penalty for tiebreaking.
+    Score a plane assignment by solving R and t, transforming target points,
+    and measuring nearest-neighbor fitness against reference points.
 
-    LOO scoring: for each plane, solve R and t from the remaining planes,
-    then predict the held-out plane's rho. The median prediction error
-    disambiguates parallel walls when both are present in both sessions.
+    This directly measures alignment quality — no arbitrary constants,
+    no scale mismatch between different scoring methods.
 
-    Δρ penalty: when LOO can't distinguish assignments (e.g. one parallel
-    wall is missing from one session), smaller raw Δρ is preferred — this
-    encodes the physical prior that cameras in the same mount didn't move
-    far between sessions, so the same wall should have similar ρ.
-
-    Assignments with fewer than 3 planes cannot be LOO-scored and return inf.
-
-    Returns: score (lower is better).
+    Returns: (score, info_dict) where score is negative fitness (lower=better)
+    and info_dict has the solve details.
     """
-    if len(candidate) < 3:
-        return float("inf")
+    from scipy.spatial import cKDTree
 
     n_dirs = count_independent_directions(candidate)
     if n_dirs < 2:
-        return float("inf")
+        return float("inf"), {}
 
-    loo_errors = []
+    R = solve_rotation(candidate)
+    if n_dirs >= 3:
+        t = solve_translation_full(candidate, R)
+    else:
+        t = solve_translation_constrained(candidate, R)
 
-    for i in range(len(candidate)):
-        remaining = candidate[:i] + candidate[i+1:]
+    # Transform target points
+    tgt_transformed = (R @ tgt_pts.T).T + t
 
-        if len(remaining) < 2:
-            continue
+    # Measure fitness: fraction of target points with a neighbor within max_corr_dist
+    tree = cKDTree(ref_pts)
+    dists, _ = tree.query(tgt_transformed)
+    inlier_mask = dists < max_corr_dist
+    fitness = float(inlier_mask.sum() / len(tgt_transformed))
+    inlier_rmse = float(np.sqrt(np.mean(dists[inlier_mask]**2))) if inlier_mask.any() else float('inf')
 
-        n_dirs_loo = count_independent_directions(remaining)
-        if n_dirs_loo < 2:
-            continue
+    rot_deg = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+    trans_m = float(np.linalg.norm(t))
 
-        R_loo = solve_rotation(remaining)
-        if n_dirs_loo >= 3:
-            t_loo = solve_translation_full(remaining, R_loo)
-        else:
-            t_loo = solve_translation_constrained(remaining, R_loo)
+    info = {
+        "n_planes": len(candidate),
+        "n_dirs": n_dirs,
+        "rot_deg": rot_deg,
+        "trans_m": trans_m,
+        "fitness": fitness,
+        "inlier_rmse": inlier_rmse,
+    }
 
-        held_out = candidate[i]
-        rho_predicted = np.dot(held_out["ref_normal"], t_loo) + held_out["tgt_rho"]
-        rho_err = abs(rho_predicted - held_out["ref_rho"])
-        loo_errors.append(rho_err)
-
-    if not loo_errors:
-        return float("inf")
-
-    median_loo = float(np.median(loo_errors))
-
-    # Mean Δρ: small tiebreaker favoring assignments with smaller raw rho differences
-    mean_delta_rho = float(np.mean([abs(m["ref_rho"] - m["tgt_rho"]) for m in candidate]))
-
-    # Direction bonus + Δρ tiebreaker
-    score = median_loo - 0.1 * n_dirs + 0.01 * mean_delta_rho
-    return score
+    # Score: negative fitness (we want highest fitness = lowest score)
+    score = -fitness
+    return score, info
 
 
 # ---------------------------------------------------------------------------
@@ -336,14 +390,20 @@ def score_assignment_loo(candidate: list[dict]) -> float:
 # ---------------------------------------------------------------------------
 
 def match_planes(ref_planes: dict, tgt_planes: dict,
-                 angle_thresh_deg: float = 30.0) -> list[dict]:
+                 ref_pts: np.ndarray, tgt_pts: np.ndarray,
+                 angle_thresh_deg: float = 30.0,
+                 max_corr_dist: float = 0.1) -> list[dict]:
     """
     Match planes between reference (new session) and target (old session).
 
     Strategy:
       - floor<->floor: direct match by label
-      - walls: brute-force all valid assignments, score with LOO cross-validation
+      - walls: brute-force all valid assignments, score by point cloud fitness
       - ceiling excluded (unreliable detection in most cameras)
+
+    Scoring: each candidate assignment's R and t are used to transform the
+    target point cloud. The assignment producing the best alignment (highest
+    fitness) with the reference point cloud wins. No arbitrary constants.
 
     Returns list of matched pairs with aligned normals and rho values.
     """
@@ -357,43 +417,40 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
     # Enumerate all valid wall assignments
     assignments = enumerate_wall_assignments(ref_planes, tgt_planes, angle_thresh_deg)
     log.info(f"  Evaluating {len(assignments)} wall assignments...")
+    log.info(f"  Scoring by point cloud fitness ({len(ref_pts)} ref, {len(tgt_pts)} tgt points)")
 
-    # Score each assignment (floor + walls) using LOO
+    # Score each assignment by point cloud fitness
     best_score = float("inf")
     best_walls = []
+    all_scored = []
 
     for wall_matches in assignments:
         candidate = floor_matches + wall_matches
-        if len(candidate) < 3:
-            # Need at least 3 planes for LOO scoring
+        if len(candidate) < 2:
             continue
-        score = score_assignment_loo(candidate)
+
+        n_dirs = count_independent_directions(candidate)
+        if n_dirs < 2:
+            continue
+
+        score, info = score_assignment_fitness(candidate, ref_pts, tgt_pts, max_corr_dist)
+        if score < float("inf"):
+            info["walls"] = wall_matches
+            info["mean_drho"] = float(np.mean([abs(m["ref_rho"] - m["tgt_rho"]) for m in candidate]))
+            all_scored.append({"score": score, **info})
+
         if score < best_score:
             best_score = score
             best_walls = wall_matches
 
-    # If LOO found nothing (all assignments < 3 planes), fall back to best 2-plane
-    if best_score == float("inf"):
-        log.info(f"  LOO scoring: no 3+ plane assignments, falling back to 2-plane")
-        for wall_matches in assignments:
-            candidate = floor_matches + wall_matches
-            if len(candidate) < 2:
-                continue
-            n_dirs = count_independent_directions(candidate)
-            if n_dirs < 2:
-                continue
-            # For 2-plane fallback, just use normal angle error
-            R = solve_rotation(candidate)
-            total_angle = 0.0
-            for m in candidate:
-                rotated_n = R @ m["tgt_normal"]
-                dot = np.clip(abs(np.dot(rotated_n, m["ref_normal"])), 0, 1)
-                total_angle += np.degrees(np.arccos(dot))
-            mean_angle = total_angle / len(candidate)
-            score = mean_angle - 0.5 * n_dirs
-            if score < best_score:
-                best_score = score
-                best_walls = wall_matches
+    # Log top 5 candidates
+    all_scored.sort(key=lambda x: x["score"])
+    for rank, c in enumerate(all_scored[:5]):
+        labels = [m["label"] for m in c["walls"]]
+        log.info(f"  #{rank+1} fitness={c['fitness']:.4f}  rmse={c['inlier_rmse']:.4f}m  "
+                 f"planes={c['n_planes']}  dirs={c['n_dirs']}  "
+                 f"rot={c['rot_deg']:.2f}°  trans={c['trans_m']:.4f}m  "
+                 f"walls={labels}")
 
     # Log best wall matches
     for m in best_walls:
@@ -521,10 +578,35 @@ def main(cfg: DictConfig):
         log.info(f"  Reference planes: {list(ref_planes.keys())}")
         log.info(f"  Target planes:    {list(tgt_planes.keys())}")
 
+        # Load depth points for fitness scoring
+        try:
+            kinect = load_kinect_config(cam_id)
+        except FileNotFoundError:
+            log.warning(f"[{cam_id}] No kinect config, skipping")
+            continue
+
+        K_depth = kinect["K_depth"]
+        ref_pts = accumulate_points(
+            cfg.reference.depth_dir, cam_id, K_depth,
+            cfg.depth.chunk, cfg.depth.frame_idx, cfg.depth.num_frames,
+            cfg.depth.max_depth, cfg.depth.subsample,
+        )
+        tgt_pts = accumulate_points(
+            cfg.target.depth_dir, cam_id, K_depth,
+            cfg.depth.chunk, cfg.depth.frame_idx, cfg.depth.num_frames,
+            cfg.depth.max_depth, cfg.depth.subsample,
+        )
+        log.info(f"  Depth points: {len(ref_pts)} ref, {len(tgt_pts)} tgt")
+
+        if len(ref_pts) < 1000 or len(tgt_pts) < 1000:
+            log.warning(f"[{cam_id}] Too few depth points for scoring, skipping")
+            continue
+
         # Match planes
         log.info(f"  --- Plane Matching ---")
-        matches = match_planes(ref_planes, tgt_planes,
-                               angle_thresh_deg=cfg.matching.angle_thresh_deg)
+        matches = match_planes(ref_planes, tgt_planes, ref_pts, tgt_pts,
+                               angle_thresh_deg=cfg.matching.angle_thresh_deg,
+                               max_corr_dist=cfg.matching.get("max_corr_dist", 0.1))
 
         if len(matches) < 2:
             log.warning(f"[{cam_id}] Only {len(matches)} matches, need at least 2. Skipping.")

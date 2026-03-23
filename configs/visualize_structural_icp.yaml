@@ -1,0 +1,11 @@
+defaults:
+  - visualize_cross_session_depth
+  - _self_
+
+# Override target extrinsics to use structural ICP results
+target:
+  extrinsics_dir: output/icp_comparison_${reference.session}_${target.session}
+  extrinsics_filename: recovered_extrinsics_structural_icp.json
+
+output:
+  dir: output/cross_session_alignment_structural_icp

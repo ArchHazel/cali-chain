@@ -1,0 +1,11 @@
+defaults:
+  - visualize_cross_session_depth
+  - _self_
+
+# Override target extrinsics to use plane solve results
+target:
+  extrinsics_dir: output/cross_session_solve_${reference.session}_${target.session}
+  extrinsics_filename: recovered_extrinsics.json
+
+output:
+  dir: output/cross_session_alignment_plane_solve
