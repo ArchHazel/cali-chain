@@ -155,10 +155,8 @@ def normalize(v: np.ndarray) -> np.ndarray:
     return v / n if n > 1e-10 else v
 
 
-def build_floor_match(ref_planes: dict, tgt_planes: dict,
-                      angle_thresh_deg: float = 30.0) -> list[dict]:
+def build_floor_match(ref_planes: dict, tgt_planes: dict) -> list[dict]:
     """Match floor between sessions by label. Returns list with 0 or 1 match."""
-    cos_thresh = np.cos(np.radians(angle_thresh_deg))
     matches = []
 
     if "floor" in ref_planes and "floor" in tgt_planes:
@@ -172,29 +170,25 @@ def build_floor_match(ref_planes: dict, tgt_planes: dict,
             tgt_rho = tgt_planes["floor"]["rho"]
 
         dot = abs(np.dot(ref_n, tgt_n))
-        if dot > cos_thresh:
-            matches.append({
-                "label": "floor",
-                "ref_normal": ref_n,
-                "tgt_normal": tgt_n,
-                "ref_rho": ref_planes["floor"]["rho"],
-                "tgt_rho": tgt_rho,
-                "dot": dot,
-            })
+        matches.append({
+            "label": "floor",
+            "ref_normal": ref_n,
+            "tgt_normal": tgt_n,
+            "ref_rho": ref_planes["floor"]["rho"],
+            "tgt_rho": tgt_rho,
+            "dot": dot,
+        })
     return matches
 
 
-def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict,
-                                angle_thresh_deg: float = 30.0) -> list[list[dict]]:
+def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict) -> list[list[dict]]:
     """
     Enumerate all valid wall-to-wall assignments.
 
     Each assignment is a list of matched wall pairs. A ref wall can match
-    at most one tgt wall and vice versa. Walls whose normals differ by
-    more than angle_thresh_deg are not paired.
+    at most one tgt wall and vice versa. All pairs are considered — the
+    assignment scorer determines which is correct.
     """
-    cos_thresh = np.cos(np.radians(angle_thresh_deg))
-
     ref_walls = {k: v for k, v in ref_planes.items() if k.startswith("wall_")}
     tgt_walls = {k: v for k, v in tgt_planes.items() if k.startswith("wall_")}
 
@@ -218,14 +212,12 @@ def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict,
                 a_tgt_n = tgt_n
                 a_tgt_rho = tgt_walls[tk]["rho"]
             dot = abs(raw_dot)
-            valid = dot > cos_thresh
             pair_info[(rk, tk)] = {
                 "ref_normal": ref_n,
                 "tgt_normal": a_tgt_n,
                 "ref_rho": ref_walls[rk]["rho"],
                 "tgt_rho": a_tgt_rho,
                 "dot": float(dot),
-                "valid": valid,
             }
 
     # Generate all possible assignments
@@ -239,15 +231,12 @@ def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict,
         if len(used_tgt) != len(set(used_tgt)):
             continue
 
-        # Build assignment, filtering out invalid (angle too large) pairs
         assignment = []
         valid_pairs = []
         for rk, tk in zip(ref_keys, perm):
             if tk is None:
                 continue
             info = pair_info[(rk, tk)]
-            if not info["valid"]:
-                continue
             valid_pairs.append((rk, tk))
             assignment.append({
                 "label": f"{rk}<->{tk}",
@@ -258,9 +247,6 @@ def enumerate_wall_assignments(ref_planes: dict, tgt_planes: dict,
                 "dot": info["dot"],
             })
 
-        # Deduplicate by the actual surviving pairs after validity filtering.
-        # Different permutations can produce the same effective assignment
-        # when unmatched (None) or invalid pairs differ.
         key = tuple(sorted(valid_pairs))
         if key in seen:
             continue
@@ -350,22 +336,77 @@ def solve_translation_constrained(matches: list[dict], R: np.ndarray,
 # Scoring: Bounded point-to-plane (primary)
 # ---------------------------------------------------------------------------
 
-def score_assignment_bounded(candidate: list[dict], ref_planes: dict,
-                             tgt_pts: np.ndarray,
-                             plane_dist_thresh: float = 0.05,
-                             extent_margin: float = 1.2) -> tuple[float, dict]:
+def _project_points_to_plane_cells(pts: np.ndarray, plane: dict,
+                                    plane_dist_thresh: float,
+                                    extent_margin: float,
+                                    cell_size: float) -> set:
     """
-    Score a wall assignment using bounded point-to-plane distance.
+    Project points onto a plane's surface and return the set of occupied
+    grid cell IDs.
 
-    For each reference plane, a transformed target point is an inlier only if:
+    A point contributes to a cell if:
       1. Perpendicular distance to the plane < plane_dist_thresh
-      2. On-plane projection falls within the oriented bounding rectangle
-         (centroid + axis_0/axis_1 + extent_0/extent_1) with margin
+      2. On-plane projection falls within the oriented bounding rect
 
-    Uses an oriented bounding rectangle instead of a circle, which better
-    captures elongated shapes like walls and pillars.
+    The plane's bounding rect is discretized into a grid of cells.
+    Returns a set of (i0, i1) tuples for occupied cells.
+    """
+    n = plane["normal"]
+    centroid = plane["centroid"]
+    axis_0 = plane["axis_0"]
+    axis_1 = plane["axis_1"]
+    extent_0 = plane["extent_0"]
+    extent_1 = plane["extent_1"]
+    rho = plane["rho"]
 
-    Returns: (score, info_dict) where score is negative inlier count (lower=better).
+    # Perpendicular distance filter
+    perp_dist = np.abs(pts @ n - rho)
+    close_mask = perp_dist < plane_dist_thresh
+    if not close_mask.any():
+        return set()
+
+    # Project onto plane axes, filter by bounding rect
+    offsets = pts[close_mask] - centroid
+    d0_signed = offsets @ axis_0
+    d1_signed = offsets @ axis_1
+    bounded_mask = ((np.abs(d0_signed) < extent_0 * extent_margin) &
+                    (np.abs(d1_signed) < extent_1 * extent_margin))
+
+    if not bounded_mask.any():
+        return set()
+
+    # Discretize into grid cells
+    d0_inlier = d0_signed[bounded_mask]
+    d1_inlier = d1_signed[bounded_mask]
+
+    width_0 = 2.0 * extent_0 * extent_margin
+    width_1 = 2.0 * extent_1 * extent_margin
+    n_cells_0 = max(1, int(width_0 / cell_size))
+    n_cells_1 = max(1, int(width_1 / cell_size))
+
+    i0 = ((d0_inlier + extent_0 * extent_margin) / cell_size).astype(np.int32)
+    i1 = ((d1_inlier + extent_1 * extent_margin) / cell_size).astype(np.int32)
+    i0 = np.clip(i0, 0, n_cells_0 - 1)
+    i1 = np.clip(i1, 0, n_cells_1 - 1)
+
+    return set(zip(i0.tolist(), i1.tolist()))
+
+
+def score_assignment_bounded(candidate: list[dict], ref_planes: dict,
+                             tgt_planes: dict,
+                             ref_pts: np.ndarray, tgt_pts: np.ndarray,
+                             plane_dist_thresh: float = 0.05,
+                             extent_margin: float = 1.2,
+                             cell_size: float = 0.1) -> tuple[float, dict]:
+    """
+    Score a wall assignment using spatial overlap on plane surfaces.
+
+    For each reference plane, project both ref points and transformed tgt
+    points onto the plane surface, count shared grid cells (intersection).
+
+    Total score = sum of per-plane intersection cell counts.
+
+    Returns: (score, info_dict) where score is negative overlap (lower=better).
     """
     n_dirs = count_independent_directions(candidate)
     if n_dirs < 2:
@@ -377,35 +418,24 @@ def score_assignment_bounded(candidate: list[dict], ref_planes: dict,
     else:
         t = solve_translation_constrained(candidate, R)
 
-    # Transform target points into reference frame
     tgt_transformed = (R @ tgt_pts.T).T + t
 
-    # Count inliers across all reference planes
-    total_inliers = 0
+    total_overlap = 0
+    per_plane_overlap = {}
+
     for label, plane in ref_planes.items():
-        n = plane["normal"]
-        centroid = plane["centroid"]
-        axis_0 = plane["axis_0"]
-        axis_1 = plane["axis_1"]
-        extent_0 = plane["extent_0"]
-        extent_1 = plane["extent_1"]
-        rho = plane["rho"]
+        ref_cells = _project_points_to_plane_cells(
+            ref_pts, plane, plane_dist_thresh, extent_margin, cell_size)
+        tgt_cells = _project_points_to_plane_cells(
+            tgt_transformed, plane, plane_dist_thresh, extent_margin, cell_size)
 
-        # 1. Perpendicular distance to infinite plane
-        perp_dist = np.abs(tgt_transformed @ n - rho)
-        close_mask = perp_dist < plane_dist_thresh
-
-        if not close_mask.any():
+        if not ref_cells or not tgt_cells:
+            per_plane_overlap[label] = 0.0
             continue
 
-        # 2. Project onto plane axes, check within oriented bounding rect
-        close_pts = tgt_transformed[close_mask]
-        offsets = close_pts - centroid
-        d0 = np.abs(offsets @ axis_0)
-        d1 = np.abs(offsets @ axis_1)
-        bounded_mask = (d0 < extent_0 * extent_margin) & (d1 < extent_1 * extent_margin)
-
-        total_inliers += bounded_mask.sum()
+        intersection = ref_cells & tgt_cells
+        total_overlap += len(intersection)
+        per_plane_overlap[label] = len(intersection) * cell_size * cell_size
 
     rot_deg = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
     trans_m = float(np.linalg.norm(t))
@@ -415,10 +445,13 @@ def score_assignment_bounded(candidate: list[dict], ref_planes: dict,
         "n_dirs": n_dirs,
         "rot_deg": rot_deg,
         "trans_m": trans_m,
-        "total_inliers": int(total_inliers),
+        "overlap": int(total_overlap),
+        "per_plane": per_plane_overlap,
+        "R": R,
+        "t": t,
     }
 
-    score = -total_inliers  # more inliers = lower score = better
+    score = -total_overlap
     return score, info
 
 
@@ -479,34 +512,35 @@ def score_assignment_fitness(candidate: list[dict],
 
 def match_planes(ref_planes: dict, tgt_planes: dict,
                  ref_pts: np.ndarray, tgt_pts: np.ndarray,
-                 angle_thresh_deg: float = 30.0,
-                 max_corr_dist: float = 0.1) -> list[dict]:
+                 max_corr_dist: float = 0.1,
+                 T_gt: np.ndarray = None) -> list[dict]:
     """
     Match planes between reference (new session) and target (old session).
 
     Strategy:
       - floor<->floor: direct match by label
-      - walls: brute-force all valid assignments, score by bounded plane fitness
+      - walls: brute-force all assignments, score by spatial overlap
       - ceiling excluded (unreliable detection in most cameras)
 
-    Scoring: if planes have centroid/radius (bounded planes), uses fast
-    bounded point-to-plane scoring. Otherwise falls back to KDTree fitness.
+    If T_gt (4×4 ground truth transform in Y-up frame) is provided,
+    per-candidate rotation and translation errors are logged.
 
     Returns list of matched pairs with aligned normals and rho values.
     """
     # Floor match (fixed by label)
-    floor_matches = build_floor_match(ref_planes, tgt_planes, angle_thresh_deg)
+    floor_matches = build_floor_match(ref_planes, tgt_planes)
     if floor_matches:
         log.info(f"  Matched floor: dot={floor_matches[0]['dot']:.4f}  "
                  f"ref_ρ={floor_matches[0]['ref_rho']:.3f}  "
                  f"tgt_ρ={floor_matches[0]['tgt_rho']:.3f}")
 
-    # Enumerate all valid wall assignments
-    assignments = enumerate_wall_assignments(ref_planes, tgt_planes, angle_thresh_deg)
+    # Enumerate all wall assignments
+    assignments = enumerate_wall_assignments(ref_planes, tgt_planes)
     log.info(f"  Evaluating {len(assignments)} wall assignments...")
 
     # Check if bounded planes are available
-    has_bounds = all("centroid" in p and "axis_0" in p for p in ref_planes.values())
+    has_bounds = (all("centroid" in p and "axis_0" in p for p in ref_planes.values()) and
+                  all("centroid" in p and "axis_0" in p for p in tgt_planes.values()))
     if has_bounds:
         log.info(f"  Scoring by bounded point-to-plane ({len(tgt_pts)} tgt points)")
     else:
@@ -528,7 +562,7 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
 
         if has_bounds:
             score, info = score_assignment_bounded(
-                candidate, ref_planes, tgt_pts,
+                candidate, ref_planes, tgt_planes, ref_pts, tgt_pts,
                 plane_dist_thresh=max_corr_dist, extent_margin=1.2)
         else:
             score, info = score_assignment_fitness(
@@ -543,39 +577,50 @@ def match_planes(ref_planes: dict, tgt_planes: dict,
             best_score = score
             best_walls = wall_matches
 
-    # Log top 5 candidates
+    # Log top 10 candidates with GT comparison
     all_scored.sort(key=lambda x: x["score"])
-    for rank, c in enumerate(all_scored[:5]):
-        labels = [m["label"] for m in c["walls"]]
-        if "total_inliers" in c:
-            metric = f"inliers={c['total_inliers']}"
-        else:
-            metric = f"fitness={c['fitness']:.4f}"
-        log.info(f"  #{rank+1} {metric}  "
-                 f"planes={c['n_planes']}  dirs={c['n_dirs']}  "
-                 f"rot={c['rot_deg']:.2f}°  trans={c['trans_m']:.4f}m  "
-                 f"walls={labels}")
+    n_show = min(10, len(all_scored))
+    log.info(f"  --- Top {n_show} of {len(all_scored)} scored candidates ---")
 
-    # Log best wall matches
-    for m in best_walls:
-        rho_diff = abs(m["ref_rho"] - m["tgt_rho"])
-        log.info(f"  Matched {m['label']}: dot={m['dot']:.4f}  "
-                 f"Δρ={rho_diff:.3f}m  "
+    gt_t = None
+    if T_gt is not None:
+        from scipy.spatial.transform import Rotation as ScipyRot
+        gt_rot = rotation_angle_deg(T_gt[:3, :3])
+        gt_t = T_gt[:3, 3]
+        gt_euler = ScipyRot.from_matrix(T_gt[:3, :3]).as_euler('xyz', degrees=True)
+        log.info(f"  GT: rot={gt_rot:.2f}°  euler=[{gt_euler[0]:.1f}, {gt_euler[1]:.1f}, {gt_euler[2]:.1f}]°  "
+                 f"t=[{gt_t[0]:.3f}, {gt_t[1]:.3f}, {gt_t[2]:.3f}]m")
+
+    for rank, c in enumerate(all_scored[:n_show]):
+        labels = [m["label"] for m in c["walls"]]
+        pp = c.get("per_plane", {})
+        total_area = sum(pp.values()) if pp else 0.0
+
+        gt_str = ""
+        if T_gt is not None and "R" in c:
+            from scipy.spatial.transform import Rotation as ScipyRot
+            c_euler = ScipyRot.from_matrix(c["R"]).as_euler('xyz', degrees=True)
+            c_t = c["t"]
+            R_err = c["R"] @ T_gt[:3, :3].T
+            rot_err = rotation_angle_deg(R_err)
+            t_err = c_t - gt_t
+            gt_str = (f"  err={rot_err:.1f}°/{np.linalg.norm(t_err):.2f}m  "
+                      f"eul=[{c_euler[0]:+.1f},{c_euler[1]:+.1f},{c_euler[2]:+.1f}]  "
+                      f"t=[{c_t[0]:+.2f},{c_t[1]:+.2f},{c_t[2]:+.2f}]")
+
+        log.info(f"  #{rank+1:2d} {total_area:5.1f}m²  "
+                 f"r={c['rot_deg']:5.1f}° t={c['trans_m']:.2f}m  "
+                 f"p={c['n_planes']} d={c['n_dirs']}"
+                 f"{gt_str}  {labels}")
+
+    # Log best assignment details
+    all_matches = floor_matches + best_walls
+    log.info(f"  Best assignment ({len(all_matches)} planes, score={best_score:.4f}):")
+    for m in all_matches:
+        log.info(f"    {m['label']}: dot={m['dot']:.4f}  "
                  f"ref_ρ={m['ref_rho']:.3f}  tgt_ρ={m['tgt_rho']:.3f}")
 
-    log.info(f"  Best assignment score: {best_score:.4f}")
-
-    # Log unmatched walls
-    ref_walls = {k for k in ref_planes if k.startswith("wall_")}
-    tgt_walls = {k for k in tgt_planes if k.startswith("wall_")}
-    matched_ref = {m["label"].split("<->")[0] for m in best_walls}
-    matched_tgt = {m["label"].split("<->")[1] for m in best_walls}
-    for rk in sorted(ref_walls - matched_ref):
-        log.info(f"  {rk}: no match")
-    for tk in sorted(tgt_walls - matched_tgt):
-        log.info(f"  (target {tk}: unmatched)")
-
-    return floor_matches + best_walls
+    return all_matches
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +754,6 @@ def main(cfg: DictConfig):
         # Match planes
         log.info(f"  --- Plane Matching ---")
         matches = match_planes(ref_planes, tgt_planes, ref_pts, tgt_pts,
-                               angle_thresh_deg=cfg.matching.angle_thresh_deg,
                                max_corr_dist=cfg.matching.get("max_corr_dist", 0.1))
 
         if len(matches) < 2:

@@ -274,12 +274,59 @@ def count_independent_directions(matches, parallel_thresh_deg=15.0):
 # Scoring: Bounded point-to-plane (primary)
 # ---------------------------------------------------------------------------
 
-def score_assignment_bounded(candidate, ref_planes, tgt_pts,
-                             plane_dist_thresh=0.05, extent_margin=1.2):
+def _project_points_to_plane_cells(pts, plane, plane_dist_thresh,
+                                    extent_margin, cell_size):
     """
-    Score by bounded point-to-plane: raw inlier count (not ratio).
-    A point is an inlier if perpendicular-close AND within the oriented
-    bounding rectangle on the plane surface.
+    Project points onto a plane's surface and return the set of occupied
+    grid cell IDs as (i0, i1) tuples.
+    """
+    n = plane["normal"]
+    centroid = plane["centroid"]
+    axis_0 = plane["axis_0"]
+    axis_1 = plane["axis_1"]
+    extent_0 = plane["extent_0"]
+    extent_1 = plane["extent_1"]
+    rho = plane["rho"]
+
+    perp_dist = np.abs(pts @ n - rho)
+    close_mask = perp_dist < plane_dist_thresh
+    if not close_mask.any():
+        return set()
+
+    offsets = pts[close_mask] - centroid
+    d0_signed = offsets @ axis_0
+    d1_signed = offsets @ axis_1
+    bounded_mask = ((np.abs(d0_signed) < extent_0 * extent_margin) &
+                    (np.abs(d1_signed) < extent_1 * extent_margin))
+
+    if not bounded_mask.any():
+        return set()
+
+    d0_inlier = d0_signed[bounded_mask]
+    d1_inlier = d1_signed[bounded_mask]
+
+    width_0 = 2.0 * extent_0 * extent_margin
+    width_1 = 2.0 * extent_1 * extent_margin
+    n_cells_0 = max(1, int(width_0 / cell_size))
+    n_cells_1 = max(1, int(width_1 / cell_size))
+
+    i0 = ((d0_inlier + extent_0 * extent_margin) / cell_size).astype(np.int32)
+    i1 = ((d1_inlier + extent_1 * extent_margin) / cell_size).astype(np.int32)
+    i0 = np.clip(i0, 0, n_cells_0 - 1)
+    i1 = np.clip(i1, 0, n_cells_1 - 1)
+
+    return set(zip(i0.tolist(), i1.tolist()))
+
+
+def score_assignment_bounded(candidate, ref_planes, tgt_planes,
+                             ref_pts, tgt_pts,
+                             plane_dist_thresh=0.05, extent_margin=1.2,
+                             cell_size=0.1):
+    """
+    Score by spatial overlap on reference plane surfaces.
+    For each reference plane, project both ref points and transformed tgt
+    points onto the plane surface, count shared grid cells (intersection).
+    Score = -sum(per-plane intersection cell counts).
     """
     n_dirs = count_independent_directions(candidate)
     if n_dirs < 2:
@@ -293,29 +340,22 @@ def score_assignment_bounded(candidate, ref_planes, tgt_pts,
 
     tgt_transformed = (R @ tgt_pts.T).T + t
 
-    total_inliers = 0
+    total_overlap = 0
+    per_plane_overlap = {}
+
     for label, plane in ref_planes.items():
-        n = plane["normal"]
-        centroid = plane["centroid"]
-        axis_0 = plane["axis_0"]
-        axis_1 = plane["axis_1"]
-        extent_0 = plane["extent_0"]
-        extent_1 = plane["extent_1"]
-        rho = plane["rho"]
+        ref_cells = _project_points_to_plane_cells(
+            ref_pts, plane, plane_dist_thresh, extent_margin, cell_size)
+        tgt_cells = _project_points_to_plane_cells(
+            tgt_transformed, plane, plane_dist_thresh, extent_margin, cell_size)
 
-        perp_dist = np.abs(tgt_transformed @ n - rho)
-        close_mask = perp_dist < plane_dist_thresh
-
-        if not close_mask.any():
+        if not ref_cells or not tgt_cells:
+            per_plane_overlap[label] = 0.0
             continue
 
-        close_pts = tgt_transformed[close_mask]
-        offsets = close_pts - centroid
-        d0 = np.abs(offsets @ axis_0)
-        d1 = np.abs(offsets @ axis_1)
-        bounded_mask = (d0 < extent_0 * extent_margin) & (d1 < extent_1 * extent_margin)
-
-        total_inliers += bounded_mask.sum()
+        intersection = ref_cells & tgt_cells
+        total_overlap += len(intersection)
+        per_plane_overlap[label] = len(intersection) * cell_size * cell_size
 
     rot_deg = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
     trans_m = float(np.linalg.norm(t))
@@ -325,10 +365,13 @@ def score_assignment_bounded(candidate, ref_planes, tgt_pts,
         "n_dirs": n_dirs,
         "rot_deg": rot_deg,
         "trans_m": trans_m,
-        "total_inliers": int(total_inliers),
+        "overlap": int(total_overlap),
+        "per_plane": per_plane_overlap,
+        "R": R,
+        "t": t,
     }
 
-    return -total_inliers, info
+    return -total_overlap, info
 
 
 # ---------------------------------------------------------------------------
@@ -379,20 +422,20 @@ def score_assignment_fitness(candidate, ref_pts, tgt_pts, max_corr_dist=0.5):
 # ---------------------------------------------------------------------------
 
 def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
-                              angle_thresh_deg=90.0, max_corr_dist=0.5):
+                              max_corr_dist=0.5, T_gt=None):
     """
     Match planes between two different cameras in the same session.
 
     Floor and ceiling are matched by semantic label (same physical surface).
     Walls are brute-forced since wall_0 in one camera may correspond to
-    any wall in the other camera.
-
-    angle_thresh_deg only applies to wall matching (high threshold since
-    cameras on different walls see walls from very different angles).
+    any wall in the other camera. All pairs are considered — the assignment
+    scorer determines which is correct.
 
     Uses bounded plane scoring if available, falls back to KDTree fitness.
+
+    If T_gt (4×4 ground truth transform in Y-up frame) is provided,
+    per-candidate rotation and translation errors are logged.
     """
-    cos_thresh = np.cos(np.radians(angle_thresh_deg))
 
     # --- Fixed matches by label (floor only; ceiling excluded as unreliable) ---
     fixed_matches = []
@@ -454,11 +497,11 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
                 "ref_rho": ref_walls[rk]["rho"],
                 "tgt_rho": a_tgt_rho,
                 "dot": float(dot),
-                "valid": dot > cos_thresh,
             }
 
     # Check if bounded planes are available
-    has_bounds = all("centroid" in p and "axis_0" in p for p in ref_planes.values())
+    has_bounds = (all("centroid" in p and "axis_0" in p for p in ref_planes.values()) and
+                  all("centroid" in p and "axis_0" in p for p in tgt_planes.values()))
     if has_bounds:
         log.info(f"    Scoring by bounded point-to-plane ({len(tgt_pts)} tgt points)")
     else:
@@ -478,15 +521,12 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
         if len(used_tgt) != len(set(used_tgt)):
             continue
 
-        # Build assignment, filtering out invalid (angle too large) pairs
         wall_matches = []
         valid_pairs = []
         for rk, tk in zip(ref_keys, perm):
             if tk is None:
                 continue
             info = pair_info[(rk, tk)]
-            if not info["valid"]:
-                continue
             valid_pairs.append((rk, tk))
             wall_matches.append({
                 "label": f"{rk}<->{tk}",
@@ -497,7 +537,6 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
                 "dot": info["dot"],
             })
 
-        # Deduplicate by actual surviving pairs after validity filtering
         key = tuple(sorted(valid_pairs))
         if key in seen:
             continue
@@ -514,7 +553,7 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
 
         if has_bounds:
             score, info = score_assignment_bounded(
-                candidate, ref_planes, tgt_pts,
+                candidate, ref_planes, tgt_planes, ref_pts, tgt_pts,
                 plane_dist_thresh=max_corr_dist, extent_margin=1.2)
         else:
             score, info = score_assignment_fitness(
@@ -528,18 +567,43 @@ def match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
             best_score = score
             best_walls = wall_matches
 
-    # Log top 5 candidates
+    # Log top 10 scored candidates with GT comparison
     top_candidates.sort(key=lambda x: x["score"])
-    for rank, c in enumerate(top_candidates[:5]):
+    n_show = min(10, len(top_candidates))
+    log.info(f"    --- Top {n_show} of {len(top_candidates)} scored candidates ---")
+
+    # Compute GT info if available
+    if T_gt is not None:
+        gt_rot = rotation_angle_deg(T_gt[:3, :3])
+        gt_t = T_gt[:3, 3]
+        # Convert GT rotation to Euler angles (XYZ) for per-axis comparison
+        from scipy.spatial.transform import Rotation as ScipyRot
+        gt_euler = ScipyRot.from_matrix(T_gt[:3, :3]).as_euler('xyz', degrees=True)
+        log.info(f"    GT: rot={gt_rot:.2f}°  euler=[{gt_euler[0]:.1f}, {gt_euler[1]:.1f}, {gt_euler[2]:.1f}]°  "
+                 f"t=[{gt_t[0]:.3f}, {gt_t[1]:.3f}, {gt_t[2]:.3f}]m")
+
+    for rank, c in enumerate(top_candidates[:n_show]):
         labels = [m["label"] for m in c["walls"]]
-        if "total_inliers" in c:
-            metric = f"inliers={c['total_inliers']}"
-        else:
-            metric = f"fitness={c['fitness']:.4f}  rmse={c['inlier_rmse']:.4f}m"
-        log.info(f"    #{rank+1} {metric}  "
-                 f"planes={c['n_planes']}  dirs={c['n_dirs']}  "
-                 f"rot={c['rot_deg']:.2f}°  trans={c['trans_m']:.4f}m  "
-                 f"walls={labels}")
+        pp = c.get("per_plane", {})
+        total_area = sum(pp.values()) if pp else 0.0
+
+        # Full 6DOF output + GT comparison
+        gt_str = ""
+        if T_gt is not None and "R" in c:
+            from scipy.spatial.transform import Rotation as ScipyRot
+            c_euler = ScipyRot.from_matrix(c["R"]).as_euler('xyz', degrees=True)
+            c_t = c["t"]
+            R_err = c["R"] @ T_gt[:3, :3].T
+            rot_err = rotation_angle_deg(R_err)
+            t_err = c_t - gt_t
+            gt_str = (f"  err={rot_err:.1f}°/{np.linalg.norm(t_err):.2f}m  "
+                      f"eul=[{c_euler[0]:+.1f},{c_euler[1]:+.1f},{c_euler[2]:+.1f}]  "
+                      f"t=[{c_t[0]:+.2f},{c_t[1]:+.2f},{c_t[2]:+.2f}]")
+
+        log.info(f"    #{rank+1:2d} {total_area:5.1f}m²  "
+                 f"r={c['rot_deg']:5.1f}° t={c['trans_m']:.2f}m  "
+                 f"p={c['n_planes']} d={c['n_dirs']}"
+                 f"{gt_str}  {labels}")
 
     all_matches = fixed_matches + best_walls
     log.info(f"    Best assignment ({len(all_matches)} planes, score={best_score:.4f}):")
@@ -655,8 +719,8 @@ def main(cfg: DictConfig):
         results["plane_solve"] = {"error": "missing planes"}
     else:
         matches = match_planes_cross_camera(ref_planes, tgt_planes, ref_pts, tgt_pts,
-                                            angle_thresh_deg=cfg.matching.angle_thresh_deg,
-                                            max_corr_dist=cfg.icp.max_corr_dist)
+                                            max_corr_dist=cfg.icp.max_corr_dist,
+                                            T_gt=T_gt_yup)
 
         if len(matches) < 2:
             log.warning(f"  Only {len(matches)} matches, need at least 2")

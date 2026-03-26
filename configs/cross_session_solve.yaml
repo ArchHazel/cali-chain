@@ -3,7 +3,7 @@ defaults:
 
 # Reference session (new, has extrinsics)
 reference:
-  session: calib_4
+  session: calib_5
   planes_dir: output/${reference.session}/semantic_planes
   extrinsics_dir: output/${reference.session}/extrinsics
   extrinsics_filename: cam_extrinsics.json
@@ -11,7 +11,7 @@ reference:
 
 # Target session (old, no extrinsics — we want to recover these)
 target:
-  session: traj_0
+  session: calib_4
   planes_dir: output/${target.session}/semantic_planes
   depth_dir: data/${target.session}/videos
 
