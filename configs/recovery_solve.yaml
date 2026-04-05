@@ -1,0 +1,23 @@
+defaults:
+  - _self_
+
+environment: living_room
+camera_id: new
+
+recovery_dir: output/recovery
+
+depth:
+  num_frames: 10
+  max_depth: 8.0
+  subsample: 4
+
+scoring:
+  plane_dist_thresh: 0.1
+  extent_margin: 1.2
+  cell_size: 0.1
+
+# 0 = use all walls from planes.json; otherwise cap at this number
+max_walls: 4
+
+# Empty list = all segments; otherwise list specific ones
+segments: []
